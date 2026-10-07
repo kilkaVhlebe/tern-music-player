@@ -1,0 +1,5 @@
+# Local editor and runtime artifacts
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
