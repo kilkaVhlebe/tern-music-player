@@ -1,0 +1,14 @@
+schema = 1
+id = "ytmusic"
+name = "YouTube Music"
+version = "0.2.0"
+description = "A YouTube player with filtered search, saved playlists and similar-track autoplay via mpv and yt-dlp."
+icon = "wave"
+host = "src/host.luau"
+window = "src/window.luau"
+styles = ["styles/player.css"]
+
+[[blocks]]
+id = "player"
+title = "YouTube Player"
+icon = "play"
