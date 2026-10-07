@@ -52,6 +52,8 @@ local function read_file(name)
 	handle:close()
 	return text
 end
+local previous_text = read_file(STATE) or ''
+local previous_pid = tonumber(string.match(previous_text, 'pid=(%d+)') or '')
 
 local function write_file(name, text)
 	local handle = io.open(name, 'wb')
@@ -344,9 +346,8 @@ local function process_commands()
 	end
 end
 
--- True when another bridge is writing the state file right now: the plugin
--- spawned a fresh player because this one looked dead, and two players must not
--- fight over the same files. Our own pid is in the state we just wrote.
+-- True when a newer bridge owns the fresh state file. A replacement records
+-- the PID it found at startup so it can reclaim that owner's last write.
 local function taken_over()
 	local text = read_file(STATE)
 	if text == nil then
@@ -360,13 +361,23 @@ local function taken_over()
 	if os.time() - beat > 3 then
 		return false
 	end
-	return pid ~= utils.getpid()
+	return pid ~= utils.getpid() and pid ~= previous_pid
 end
 
 local function tick()
+	if not first_tick and taken_over() then
+		mp.msg.info('tern bridge: another player owns the state file; stopping')
+		mp.commandv('quit')
+		return
+	end
 	process_commands()
 	local state = snapshot()
-	if state ~= last_state then
+	local owner_text = read_file(STATE) or ''
+	local owner_pid = tonumber(string.match(owner_text, 'pid=(%d+)') or '')
+	local reclaim_previous = owner_pid ~= nil
+		and owner_pid == previous_pid
+		and owner_pid ~= utils.getpid()
+	if state ~= last_state or reclaim_previous then
 		last_state = state
 		write_file(STATE, state)
 		queue_dirty = true
@@ -374,11 +385,6 @@ local function tick()
 	if queue_dirty then
 		queue_dirty = false
 		write_queue()
-	end
-	if not first_tick and taken_over() then
-		mp.msg.info('tern bridge: another player owns the state file; stopping')
-		mp.commandv('quit')
-		return
 	end
 	first_tick = false
 	mp.add_timeout(TICK, tick)

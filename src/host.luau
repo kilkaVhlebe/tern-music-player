@@ -328,7 +328,13 @@ local function save_playlist(block: Block, source: "results" | "queue"): ()
 		say(block, failure or "Could not save the playlist")
 		return
 	end
-	block.state.sel_playlist = #player.playlists()
+	local playlists = player.playlists()
+	for index, playlist in playlists do
+		if string.lower(playlist.name) == string.lower(name) then
+			block.state.sel_playlist = index
+			break
+		end
+	end
 	say(block, string.format("Saved %d tracks to %s", #tracks, name))
 end
 
@@ -401,14 +407,14 @@ end
 
 local function start_search(block: Block): ()
 	local query = block.state.query
+	block.search_seq += 1
+	local seq = block.search_seq
 	if query == "" then
 		block.state.results = {}
 		block.searching = false
 		block.rendered = ""
 		return
 	end
-	block.search_seq += 1
-	local seq = block.search_seq
 	block.searching = true
 	block.rendered = ""
 	player.search(query, function(tracks: { Track }, err: string?)
@@ -426,6 +432,7 @@ local function start_search(block: Block): ()
 		block.rendered = ""
 		block.context:render()
 	end)
+
 end
 
 local function edit_text(text: string, cursor: number, k: Key): (string, number, boolean)
@@ -469,6 +476,8 @@ local function edit_query(block: Block, k: Key): boolean
 	end
 	state.cursor = cursor
 	if query ~= state.query then
+		block.search_seq += 1
+		block.searching = false
 		state.query = query
 		state.sel_search = 1
 		block.search_at = tern.now() + SEARCH_DEBOUNCE_MS
@@ -709,7 +718,7 @@ local function queue_section(state: State, p: yt.Player?): Node
 	local list = ui.list(items)
 	local children: { Node } = list.c or {}
 	for index, child in children do
-		with(child, { key = "q" .. tostring(index), actions = { click = "jump=" .. tostring(index) } })
+		with(child, { key = "q" .. tostring(index), actions = { click = "jump=" .. tostring(index - 1) } })
 	end
 	local selected: string? = nil
 	if #queue > 0 then
@@ -926,8 +935,8 @@ end
 
 -- The poll loop ---------------------------------------------------------
 
--- One poll. Returns false when there is nothing left to watch, so the loop can
--- stop when the last block closes.
+-- One poll. With no visible blocks, keep the heartbeat only for an active player
+-- whose similar-track autoplay is enabled.
 local function poll_once(): boolean
 	loop = nil
 	local live = alive_panes()
@@ -936,7 +945,8 @@ local function poll_once(): boolean
 			blocks[pane] = nil
 		end
 	end
-	if next(blocks) == nil then
+	local keep_alive = player.autoplay() and (player.is_running() or player.state() ~= nil)
+	if next(blocks) == nil and not keep_alive then
 		return false
 	end
 	player.check_tools()
@@ -1051,12 +1061,13 @@ local function key_search(block: Block, k: Key): boolean?
 		end
 	elseif k.name == "escape" then
 		if state.query ~= "" then
+			block.search_seq += 1
+			block.searching = false
 			state.query = ""
 			state.cursor = 0
 			block.search_at = tern.now() + SEARCH_DEBOUNCE_MS
-		else
-			state.mode = "queue"
 		end
+		state.mode = "queue"
 	else
 		return edit_query(block, k)
 	end

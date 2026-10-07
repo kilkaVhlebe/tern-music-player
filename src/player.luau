@@ -60,6 +60,17 @@ local autoplay_seed: string? = nil
 local autoplay_searching = false
 local autoplay_seen: { [string]: boolean } = {}
 local autoplay_seen_order: { string } = {}
+local spawned_pid: number? = nil
+local exited_pid: number? = nil
+local spawn_generation = 0
+
+local function invalidate_autoplay(): ()
+	autoplay_generation += 1
+	autoplay_searching = false
+	autoplay_seed = nil
+	autoplay_message = ""
+end
+
 local playlists: { Playlist } = {}
 local tick_autoplay: (() -> ())? = nil
 
@@ -165,9 +176,8 @@ function player.set_autoplay(enabled: boolean): (boolean, string?)
 		return false, tostring(failure)
 	end
 	autoplay_enabled = enabled
-	autoplay_generation += 1
+	invalidate_autoplay()
 	autoplay_seed = nil
-	autoplay_searching = false
 	autoplay_message = if enabled then "Autoplay is on" else "Autoplay is off"
 	notify()
 	return true, nil
@@ -330,11 +340,22 @@ local function spawn(): ()
 		return
 	end
 	spawned_at = tern.now()
+	spawn_generation += 1
+	local generation = spawn_generation
 	yt.ensure_dirs()
 	yt.wipe_commands()
+	spawned_pid = nil
 	local started, failure = pcall(function(): string?
 		process.run(yt.mpv_argv(), { cwd = yt.data_dir, env = yt.tool_env() }, function(result: ProcessResult)
+			if generation ~= spawn_generation then
+				return
+			end
+			local last = yt.read()
+			exited_pid = spawned_pid or if last == nil then nil else last.pid
+			spawned_pid = nil
 			running = false
+			current = nil
+			queue = {}
 			if result.status ~= 0 then
 				tool_problem = string.format(
 					"mpv exited with status %d; see mpv.log in the plugin's data directory",
@@ -346,6 +367,7 @@ local function spawn(): ()
 		return nil
 	end)
 	if not started then
+		spawned_pid = nil
 		tool_problem = tool_missing(yt.mpv_bin(), tostring(failure))
 		running = false
 		notify()
@@ -365,15 +387,24 @@ function player.ensure(): ()
 	-- memory is empty while the player keeps running, and spawning here would
 	-- leave two players writing the same files.
 	local latest = yt.read()
-	if yt.fresh(latest) then
+	if yt.fresh(latest) and (exited_pid == nil or latest.pid ~= exited_pid) then
+		if exited_pid ~= nil then
+			exited_pid = nil
+		end
 		current = latest
 		return
+	end
+	if exited_pid ~= nil and latest ~= nil and latest.pid == exited_pid then
+		current = nil
 	end
 	spawn()
 end
 
 -- Sends a command now, or remembers it for the moment a fresh player appears.
-function player.request(name: string, ...: string): ()
+local function request(name: string, invalidate: boolean, ...: string): ()
+	if invalidate then
+		invalidate_autoplay()
+	end
 	if yt.fresh(current) then
 		yt.send(name, ...)
 		return
@@ -383,11 +414,26 @@ function player.request(name: string, ...: string): ()
 	player.ensure()
 end
 
+function player.request(name: string, ...: string): ()
+	request(
+		name,
+		name == "play" or name == "clear" or name == "jump" or name == "remove"
+			or name == "enqueue" or name == "next" or name == "prev",
+		...
+	)
+end
+
 -- Reads the files the bridge wrote. Returns the fresh state, if any.
 function player.poll(): yt.Player?
 	local latest = yt.read()
-	if yt.fresh(latest) then
+	if yt.fresh(latest) and (exited_pid == nil or latest.pid ~= exited_pid) then
+		if exited_pid ~= nil then
+			exited_pid = nil
+		end
 		current = latest
+		if running then
+			spawned_pid = latest.pid
+		end
 		flush_pending()
 	else
 		current = nil
@@ -396,7 +442,7 @@ function player.poll(): yt.Player?
 			player.ensure()
 		end
 	end
-	queue = yt.queue()
+	queue = if current == nil then {} else yt.queue()
 	if tick_autoplay ~= nil then
 		tick_autoplay()
 	end
@@ -499,6 +545,11 @@ tick_autoplay = function(): ()
 	autoplay_searching = true
 	local generation = autoplay_generation
 	local seed_video = state.video
+	local seed_pid = state.pid
+	local seed_queue: { yt.Flat } = {}
+	for _, row in queue do
+		table.insert(seed_queue, row)
+	end
 	local seed = queue[state.index + 1]
 	local title = if state.title ~= "" then state.title else if seed == nil then "" else seed.title
 	local artist = if state.artist ~= "" then state.artist else if seed == nil then "" else seed.artist
@@ -518,6 +569,29 @@ tick_autoplay = function(): ()
 		if generation ~= autoplay_generation then
 			return
 		end
+		local latest_state = current
+		local context_changed = latest_state == nil
+			or latest_state.pid ~= seed_pid
+			or #queue ~= #seed_queue
+		if not context_changed then
+			for index, row in queue do
+				local original = seed_queue[index]
+				if original == nil
+					or row.index ~= original.index
+					or row.url ~= original.url
+					or row.video ~= original.video
+					or row.title ~= original.title
+					or row.artist ~= original.artist
+				then
+					context_changed = true
+					break
+				end
+			end
+		end
+		if context_changed then
+			invalidate_autoplay()
+			return
+		end
 		autoplay_searching = false
 		if err ~= nil then
 			autoplay_message = "Autoplay search failed: " .. first_line(err)
@@ -535,11 +609,11 @@ tick_autoplay = function(): ()
 		for _, track in tracks do
 			local seen = autoplay_seen[track.video] == true
 			if track.video ~= "" and known[track.video] ~= true and not seen and added < AUTOPLAY_ADD_LIMIT then
-				player.request("enqueue", track.url, track.video, track.title, track.artist)
+				request("enqueue", false, track.url, track.video, track.title, track.artist)
 				known[track.video] = true
 				added += 1
+				remember_autoplay(track.video)
 			end
-			remember_autoplay(track.video)
 		end
 		if added > 0 then
 			autoplay_message = string.format("Added %d similar tracks", added)

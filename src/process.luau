@@ -121,7 +121,7 @@ Set shell = CreateObject("WScript.Shell")
 powershell = WScript.Arguments(0)
 runner = WScript.Arguments(1)
 request = WScript.Arguments(2)
-command = Quote(powershell) & " -NoLogo -NoProfile -NonInteractive -File " & Quote(runner) & " " & Quote(request)
+command = Quote(powershell) & " -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File " & Quote(runner) & " " & Quote(request)
 WScript.Quit shell.Run(command, 0, True)
 
 Function Quote(value)

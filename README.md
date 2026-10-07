@@ -33,14 +33,10 @@ and Scoop included — without extra setup; see
 
 ## Install
 
-```sh
-tern plugin install github.com/<owner>/tern-youtube-player
-```
-
-or, to work on the plugin where it is:
+From the repository root, link the local checkout:
 
 ```sh
-tern plugin link ~/src/tern-youtube-player
+tern plugin link .
 ```
 
 Then run **YouTube Music: Open player** from the command palette, click a

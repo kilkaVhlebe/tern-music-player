@@ -299,13 +299,17 @@ end
 
 -- Byte offsets of the character before and after `index`, for editing a query.
 function ytmusic.prev_at(text: string, index: number): number
-	local last = 0
+	local boundary = 0
 	local position = 1
-	while position < index and position <= #text do
-		last = position
-		position += char_width(utf8.codepoint(text, position))
+	while position <= #text do
+		local next_boundary = position + char_width(utf8.codepoint(text, position)) - 1
+		if next_boundary >= index then
+			return boundary
+		end
+		boundary = next_boundary
+		position = next_boundary + 1
 	end
-	return last
+	return boundary
 end
 
 function ytmusic.next_at(text: string, index: number): number
