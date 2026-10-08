@@ -1,8 +1,8 @@
 schema = 1
 id = "ytmusic"
 name = "YouTube Music"
-version = "0.3.0"
-description = "YouTube Music catalog search for tracks, artists, playlists and podcasts with related-track autoplay."
+version = "0.4.0"
+description = "YouTube Music and SoundCloud search for tracks with merged results, related-track autoplay and automatic failed-track replacement."
 icon = "wave"
 host = "src/host.luau"
 window = "src/window.luau"

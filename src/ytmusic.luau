@@ -49,6 +49,9 @@ export type Player = {
 	title: string,
 	artist: string,
 	video: string,
+	url: string,
+	failed: number?,
+	fail_seq: number,
 	err: string,
 }
 
@@ -149,6 +152,9 @@ local function parse_state(text: string): Player?
 		title = fields.title or "",
 		artist = fields.artist or "",
 		video = fields.video or "",
+		url = fields.url or "",
+		failed = number_of(fields, "failed"),
+		fail_seq = number_of(fields, "fail_seq") or 0,
 		err = fields.err or "",
 	}
 end
@@ -261,15 +267,31 @@ function ytmusic.youtube_id(url: string): string?
 	return id
 end
 
-function ytmusic.is_youtube(url: string): boolean
+-- Where a URL plays: "youtube", "soundcloud", or "" for anything the player
+-- does not search itself (yt-dlp may still play it as a pasted link).
+function ytmusic.source_of(url: string): string
 	local host = string.match(url, "^https?://([^/]+)")
 	if host == nil then
-		return false
+		return ""
 	end
 	host = string.lower(host)
-	return host == "youtu.be"
+	if host == "youtu.be"
 		or string.find(host, "youtube.com", 1, true) ~= nil
 		or string.find(host, "youtube-nocookie.com", 1, true) ~= nil
+	then
+		return "youtube"
+	end
+	if host == "soundcloud.com"
+		or host == "snd.sc"
+		or string.sub(host, -14) == ".soundcloud.com"
+	then
+		return "soundcloud"
+	end
+	return ""
+end
+
+function ytmusic.is_playable_url(url: string): boolean
+	return ytmusic.source_of(url) ~= ""
 end
 
 local function char_width(code: number): number

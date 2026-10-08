@@ -43,6 +43,29 @@ local last_state = nil
 local queue_dirty = true
 local first_tick = true
 
+-- Failed-entry hold: with `hold on` the bridge pauses after a load failure
+-- and reports the failed queue index, so the plugin can look up the same
+-- track on the other source and swap it into place (the `replace` command).
+-- The hold releases itself after HOLD_MAX, so a stopped poll loop never
+-- leaves the queue paused forever.
+local HOLD_MAX = 15
+local hold_enabled = false
+local failed_index = -1
+local fail_seq = 0       -- rises with every captured failure, so the plugin
+                         -- cannot mistake a repeat for one it has already seen
+local hold_started = 0
+local paused_by_hold = false
+
+local function clear_hold(unpause)
+	failed_index = -1
+	if paused_by_hold then
+		paused_by_hold = false
+		if unpause then
+			mp.commandv('set', 'pause', 'no')
+		end
+	end
+end
+
 local function read_file(name)
 	local handle = io.open(name, 'rb')
 	if handle == nil then
@@ -138,6 +161,9 @@ local function snapshot()
 		'title=' .. clean(title),
 		'artist=' .. clean(artist),
 		'video=' .. clean(hint.id),
+		'url=' .. clean(current),
+		'failed=' .. tostring(failed_index),
+		'fail_seq=' .. tostring(fail_seq),
 		'err=' .. clean(last_err),
 	}
 	return table.concat(lines, '\n') .. '\n'
@@ -179,6 +205,10 @@ local function play_index(index)
 end
 
 commands['toggle'] = function()
+	-- Toggling during a hold means the user took the queue back; the pause
+	-- itself stays for the flip below to resolve (it is what toggle reads).
+	failed_index = -1
+	paused_by_hold = false
 	local count = mp.get_property_number('playlist-count') or 0
 	if count == 0 then
 		return
@@ -204,10 +234,12 @@ commands['toggle'] = function()
 end
 
 commands['next'] = function()
+	clear_hold(true)
 	mp.commandv('playlist-next')
 end
 
 commands['prev'] = function()
+	clear_hold(true)
 	mp.commandv('playlist-prev')
 end
 
@@ -246,6 +278,7 @@ commands['play'] = function(args)
 	if url == '' then
 		return
 	end
+	clear_hold(true)
 	hints[url] = { id = args[2] or '', title = args[3] or '', artist = args[4] or '' }
 	mp.commandv('playlist-clear')
 	mp.commandv('loadfile', url, 'replace')
@@ -267,6 +300,7 @@ commands['jump'] = function(args)
 	if index == nil or index < 0 then
 		return
 	end
+	clear_hold(true)
 	play_index(math.floor(index))
 end
 
@@ -275,11 +309,13 @@ commands['remove'] = function(args)
 	if index == nil or index < 0 then
 		return
 	end
+	clear_hold(true)
 	mp.commandv('playlist-remove', tostring(math.floor(index)))
 	queue_dirty = true
 end
 
 commands['clear'] = function()
+	clear_hold(true)
 	-- playlist-clear keeps the current entry; the queue here must end up empty.
 	local count = mp.get_property_number('playlist-count') or 0
 	for index = count - 1, 0, -1 do
@@ -291,6 +327,59 @@ end
 
 commands['quit'] = function()
 	mp.commandv('quit')
+end
+
+commands['hold'] = function(args)
+	if args[1] == 'on' then
+		hold_enabled = true
+	else
+		hold_enabled = false
+		-- The plugin stopped asking: a hold it left behind must not stick.
+		clear_hold(true)
+	end
+end
+
+commands['resume'] = function(args)
+	-- The plugin gave up on replacing the failed track: continue the queue.
+	local was_failed = failed_index
+	clear_hold(true)
+	if was_failed < 0 then
+		return
+	end
+	if mp.get_property_native('idle-active') then
+		local count = mp.get_property_number('playlist-count') or 0
+		local pos = mp.get_property_number('playlist-pos')
+		if pos == nil or pos < 0 then
+			pos = mp.get_property_number('playlist-current-pos') or -1
+		end
+		if pos >= 0 and pos + 1 < count then
+			mp.commandv('playlist-play-index', tostring(pos + 1))
+		end
+	end
+end
+
+commands['replace'] = function(args)
+	local index = tonumber(args[1])
+	local url = args[2] or ''
+	if index == nil or index < 0 or url == '' then
+		return
+	end
+	index = math.floor(index)
+	hints[url] = { id = args[3] or '', title = args[4] or '', artist = args[5] or '' }
+	clear_hold(false)
+	mp.commandv('set', 'pause', 'no')
+	local count = mp.get_property_number('playlist-count') or 0
+	mp.commandv('loadfile', url, 'append')
+	if index < count then
+		-- The new entry starts at the end: slide it over the failed one and
+		-- drop that, keeping every other queue position unchanged.
+		mp.commandv('playlist-move', tostring(count), tostring(index))
+		mp.commandv('playlist-remove', tostring(index + 1))
+	else
+		index = count
+	end
+	play_index(index)
+	queue_dirty = true
 end
 
 commands['dump'] = function()
@@ -371,6 +460,10 @@ local function tick()
 		return
 	end
 	process_commands()
+	if failed_index >= 0 and os.time() - hold_started > HOLD_MAX then
+		mp.msg.info('tern bridge: hold timed out; releasing the queue')
+		clear_hold(true)
+	end
 	local state = snapshot()
 	local owner_text = read_file(STATE) or ''
 	local owner_pid = tonumber(string.match(owner_text, 'pid=(%d+)') or '')
@@ -397,11 +490,53 @@ mp.observe_property('playlist-count', nil, function()
 	queue_dirty = true
 end)
 
+-- The failed queue index of an `end-file` error: the event carries the
+-- entry's id, which is also in the playlist; the positions remain as
+-- fallbacks for mpv builds that report less.
+local function failed_position(event)
+	local entry_id = event.playlist_entry_id
+	if entry_id ~= nil then
+		local entries = mp.get_property_native('playlist') or {}
+		for index, entry in ipairs(entries) do
+			if entry.id == entry_id then
+				return index - 1
+			end
+		end
+	end
+	local pos = mp.get_property_number('playlist-playing-pos')
+	if pos ~= nil and pos >= 0 then
+		return pos
+	end
+	pos = mp.get_property_number('playlist-pos')
+	if pos ~= nil and pos >= 0 then
+		return pos
+	end
+	return -1
+end
+
 mp.register_event('end-file', function(event)
 	end_seq = end_seq + 1
 	end_reason = event.reason or 'unknown'
 	if end_reason == 'error' then
 		last_err = 'playback failed; see mpv.log'
+		local position = failed_position(event)
+		if hold_enabled and not paused_by_hold and position >= 0 then
+			failed_index = position
+			fail_seq = fail_seq + 1
+			hold_started = os.time()
+			paused_by_hold = true
+			mp.commandv('set', 'pause', 'yes')
+			queue_dirty = true
+			mp.msg.info('tern bridge: holding failed entry ' .. tostring(position))
+		else
+			mp.msg.info('tern bridge: error at ' .. tostring(position)
+				.. ' not held (hold=' .. tostring(hold_enabled)
+				.. ' paused=' .. tostring(paused_by_hold)
+				.. ' entry_id=' .. tostring(event.playlist_entry_id) .. ')')
+		end
+	elseif end_reason ~= 'eof' and end_reason ~= 'stop' and end_reason ~= 'quit' then
+		mp.msg.info('tern bridge: end-file reason=' .. tostring(end_reason)
+			.. ' entry_id=' .. tostring(event.playlist_entry_id))
 	end
 	queue_dirty = true
 end)

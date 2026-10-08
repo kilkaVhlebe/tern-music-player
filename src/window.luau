@@ -140,9 +140,9 @@ tern.command({
 	end,
 })
 
--- Clicking a YouTube link anywhere in Tern opens it in the player.
+-- Clicking a playable track link anywhere in Tern opens it in the player.
 tern.route.link(function(link: LinkRequest, _cx: WindowCx): RouteDecision?
-	if yt.is_youtube(link.url) then
+	if yt.is_playable_url(link.url) then
 		return { block = KIND, args = { link.url } }
 	end
 	return nil

@@ -155,6 +155,9 @@ local function shown(block: Block): yt.Player?
 		title = p.title,
 		artist = p.artist,
 		video = p.video,
+		url = p.url,
+		failed = p.failed,
+		fail_seq = p.fail_seq,
 		err = p.err,
 	}
 end
@@ -280,7 +283,7 @@ local function enqueue_track(block: Block, track: Track): ()
 end
 
 local function to_track(item: SearchItem): Track?
-	if item.kind ~= "track" or item.video == "" then
+	if item.kind ~= "track" or item.url == "" then
 		return nil
 	end
 	return {
@@ -489,10 +492,10 @@ local function start_search(block: Block): ()
 		end
 		block.searching = false
 		if err ~= nil then
-			say(block, "YouTube Music search failed: " .. yt.cut(err, 120))
+			say(block, "Search failed: " .. yt.cut(err, 120))
 		else
 			block.state.results = items
-			block.state.sel_search = 1
+			block.state.sel_search = math.clamp(block.state.sel_search, 1, math.max(#items, 1))
 		end
 		block.rendered = ""
 		block.context:render()
@@ -531,7 +534,7 @@ local function open_catalog_result(block: Block, item: SearchItem): ()
 		end
 		block.searching = false
 		if err ~= nil then
-			say(block, "Could not open YouTube Music result: " .. yt.cut(err, 120))
+			say(block, "Could not open result: " .. yt.cut(err, 120))
 		else
 			for _, track in tracks do
 				table.insert(state.results, to_search_item(track))
@@ -781,9 +784,13 @@ local function search_section(block: Block, state: State): Node
 	local visible = filtered_results(state)
 	local items: { Item } = {}
 	for index, result in visible do
+		local detail: string? = if result.detail ~= "" then result.detail elseif result.artist ~= "" then result.artist else nil
+		if yt.source_of(result.url) == "soundcloud" then
+			detail = if detail == nil then "SoundCloud" else detail .. " · SC"
+		end
 		items[index] = {
 			label = if result.title ~= "" then result.title else result.url,
-			detail = if result.detail ~= "" then result.detail else if result.artist ~= "" then result.artist else nil,
+			detail = detail,
 			value = if result.duration == nil then nil else yt.clock(result.duration),
 		}
 	end
@@ -807,10 +814,10 @@ local function search_section(block: Block, state: State): Node
 		empty = {
 			ui.span(
 				if block.searching
-					then "Searching YouTube Music…"
+					then "Searching…"
 					elseif #state.results > 0
 					then "No results match these filters"
-					else "Search YouTube Music for " .. string.lower(category_label(state.category)),
+					else "Search for " .. string.lower(category_label(state.category)),
 				"muted"
 			),
 		},
@@ -844,7 +851,7 @@ local function search_section(block: Block, state: State): Node
 		key = "query",
 		text = state.query,
 		cursor = yt.units_for_bytes(state.query, state.cursor),
-		placeholder = "Search YouTube Music…",
+		placeholder = "Search YouTube Music and SoundCloud…",
 	}), { grow = 1 })
 	local search_buttons: { Node } = {}
 	if state.category == "tracks" then
@@ -885,9 +892,13 @@ local function queue_section(state: State, p: yt.Player?): Node
 	local items: { Item } = {}
 	for index, row in queue do
 		local playing_row = p ~= nil and p.index == row.index
+		local detail: string? = if row.artist ~= "" then row.artist else nil
+		if yt.source_of(row.url) == "soundcloud" then
+			detail = if detail == nil then "SoundCloud" else detail .. " · SC"
+		end
 		items[index] = {
 			label = if row.title ~= "" then row.title else row.url,
-			detail = if row.artist ~= "" then row.artist else nil,
+			detail = detail,
 			icon = if playing_row then "play" else nil,
 			tone = if playing_row then "accent" else nil,
 		}
@@ -1066,6 +1077,10 @@ local function dock(state: State, p: yt.Player?, cx: BlockCx): Node
 	if autoplay_message ~= "" then
 		table.insert(status, ui.span("  · " .. autoplay_message, if string.find(autoplay_message, "failed", 1, true) then "error" else "muted"))
 	end
+	local fallback_message = player.fallback_message()
+	if fallback_message ~= "" then
+		table.insert(status, ui.span("  · " .. fallback_message, "warning"))
+	end
 	table.insert(lines, with(ui.text(status), { key = "status", role = "ytm-status" }))
 	return with(ui.col(lines), { role = "ytm-dock" })
 end
@@ -1082,6 +1097,8 @@ local function signature(block: Block): string
 		if p == nil then "" else p.title,
 		if p == nil then "" else p.artist,
 		if p == nil then "" else p.video,
+		if p == nil then "" else p.url,
+		tostring(if p == nil then nil else p.failed),
 		if p == nil then "" else p.err,
 		if p == nil then "" else tostring(p.volume),
 		if p == nil then "" else tostring(p.mute),
@@ -1105,6 +1122,7 @@ local function signature(block: Block): string
 		tostring(#player.playlists()),
 		tostring(player.autoplay()),
 		player.autoplay_message(),
+		player.fallback_message(),
 		tostring(player.preferences_problem()),
 		block.state.flash,
 		tostring(block.searching),
@@ -1133,14 +1151,17 @@ local function poll_once(): boolean
 	end
 	player.check_tools()
 	local latest = player.poll()
+	-- While this block's poll runs it can act on a failed track, so the
+	-- bridge should hold the queue after a failure; it releases on stop.
+	player.set_fallback_hold(latest ~= nil)
 	if latest ~= nil then
-		if latest.video ~= "" then
-			player.load_cover(latest.video, share_art)
+		if latest.url ~= "" then
+			player.load_cover(latest.url, share_art)
 		end
 		if latest.err ~= "" and latest.err ~= shown_err then
 			shown_err = latest.err
 			for _, block in blocks do
-				block.context:toast("error", "YouTube Music", latest.err)
+				block.context:toast("error", "Player", latest.err)
 			end
 		end
 	end
@@ -1498,7 +1519,7 @@ local player_block: BlockDef<State> = {
 		-- passes them again, and replaying them would restart the queue.
 		local first = if restored == nil then args[1] else nil
 		if first ~= nil and first ~= "" then
-			if yt.is_youtube(first) then
+			if yt.is_playable_url(first) then
 				play_track(block, {
 					url = first,
 					video = yt.youtube_id(first) or "",

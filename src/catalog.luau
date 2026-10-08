@@ -14,6 +14,9 @@ export type Item = {
 	video: string,
 	duration: number?,
 	browse_id: string,
+	-- Artwork URL when the source reported one (SoundCloud does); YouTube
+	-- thumbnails are built from the video id instead.
+	art: string?,
 }
 
 local API = "https://music.youtube.com/youtubei/v1/"

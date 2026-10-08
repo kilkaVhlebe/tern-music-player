@@ -1,9 +1,11 @@
 # tern-youtube-player
 
-A YouTube Music player for [Tern](https://stencil.so/tern): a native block with
-cover art, playback controls, a queue, YouTube Music catalog search for tracks,
-artists, playlists and podcasts, related-track autoplay, saved playlists, plus
-palette commands, a status-line segment and a route for clicked YouTube links.
+A YouTube Music and SoundCloud player for [Tern](https://stencil.so/tern): a
+native block with cover art, playback controls, a queue, merged search across
+both catalogs for tracks, artists, playlists and podcasts, related-track
+autoplay that crosses sources, automatic replacement of failed tracks from the
+other source, saved playlists, plus palette commands, a status-line segment and
+a route for clicked track links.
 
 Playback runs through `mpv --idle` in the background — no browser, no ads, no
 video, nothing to keep on screen — and the block is a view of it: closing the
@@ -39,15 +41,18 @@ tern plugin link .
 ```
 
 Then run **YouTube Music: Open player** from the command palette, click a
-YouTube link in any pane, or open **New YouTube Player block** directly. A
-palette command can also be bound with `tern.bind` or in `settings.json`
-keybinds: every command is the action `plugin.ytmusic.<id>`.
+YouTube or SoundCloud link in any pane, or open **New YouTube Player block**
+directly. A palette command can also be bound with `tern.bind` or in
+`settings.json` keybinds: every command is the action `plugin.ytmusic.<id>`.
 
 ## Using it
 
 The Search area has four YouTube Music categories: **Tracks**, **Artists**,
-**Playlists** and **Podcasts**. Tracks are filtered to YouTube Music songs;
-ordinary YouTube video search results are never mixed into the catalog.
+**Playlists** and **Podcasts**. Track search also queries SoundCloud (through
+yt-dlp's `scsearch:`) and merges both result lists — YouTube Music first,
+SoundCloud results deduplicated against them by title and duration. SoundCloud
+rows are tagged `· SC`; their tracks play from `soundcloud.com` URLs exactly
+like YouTube ones. Artists, playlists and podcasts are YouTube Music only.
 
 | Key                 | Does                                           |
 | ------------------- | ---------------------------------------------- |
@@ -93,9 +98,18 @@ Playlists persist in the plugin's key/value store; the library holds up to 40
 playlists with 200 tracks each.
 
 Similar-track autoplay is on by default. When three or fewer tracks remain, it
-uses YouTube Music's track-related recommendations and adds up to eight music
-results not already queued or recently added. It no longer uses a generic
-YouTube text search. Toggle it from the **autoplay on/off** chip.
+adds up to eight related music results not already queued or recently added:
+YouTube Music's track-related recommendations for YouTube tracks; for a
+SoundCloud track it first looks for the same title and artist on YouTube Music
+and continues from that track's recommendations, falling back to SoundCloud
+search. Toggle it from the **autoplay on/off** chip.
+
+If a queued track fails to load, the player pauses the queue in place, looks up
+the same title and artist on the other source and swaps the replacement into
+the failed position — a YouTube failure continues on SoundCloud and vice
+versa. Two attempts per URL keep a permanently broken link from cycling; after
+that (or if nothing else is found) the queue resumes where it was. Any user
+command — jumping, next, play — abandons a pending replacement.
 
 The public YouTube Music search/recommendation API is undocumented and can
 change; the implementation follows the community-maintained
@@ -166,14 +180,16 @@ block (Luau, host VM) ──poll──▶ state.txt, queue.txt ◀──writes�
   writes the state and queue files. It is why pausing, seeking and volume work
   without a socket or a helper binary.
 - The host block polls those files, renders them, and writes commands back; it
-  also owns cover art (`i.ytimg.com` thumbnails, fetched and sent as blobs),
-  yt-dlp search and the player's lifetime.
+  also owns cover art (`i.ytimg.com` thumbnails for YouTube, SoundCloud's
+  oEmbed artwork for its own tracks, fetched and sent as blobs), search and
+  the player's lifetime.
 - `src/process.luau` keeps Tern's direct process runner on non-Windows hosts.
   On Windows, it uses the built-in hidden Script Host and PowerShell runner,
   then captures dependency output without opening console windows.
 - The window half adds the palette commands (they write command files too — a
   window and its daemon are the same machine), the status segment and the
-  `youtube.com` / `youtu.be` link route.
+  link route for clickable `youtube.com`, `youtu.be` and `soundcloud.com`
+  URLs.
 
 ## Known limits
 
@@ -196,11 +212,13 @@ block (Luau, host VM) ──poll──▶ state.txt, queue.txt ◀──writes�
 - The queue lives in mpv: **Stop the player** quits it and the queue is gone.
   A player that exits on its own (a crash, `kill`) restarts on the next play
   with an empty queue.
-- Search results come from `yt-dlp -J ytsearch…`; entries without a duration
-  or uploader show as much as they have. A URL opened as an argument shows its
-  title once mpv resolves it.
-- Playback failures land in `mpv.log` (and as a toast); the block itself only
-  knows that a file ended with an error.
+- Track search comes from the public YouTube Music search API plus yt-dlp's
+  `scsearch:`; other categories and detail views use the catalog API. Entries
+  without a duration or uploader show as much as they have. A URL opened as an
+  argument shows its title once mpv resolves it.
+- Playback failures land in `mpv.log` (and as a toast) and trigger the
+  failed-track replacement described above; the block itself only knows that a
+  file ended with an error.
 - mpv is started with `--no-config` and `--ytdl-format=bestaudio/best`: audio
   only, no video, no user config.
 
