@@ -62,6 +62,7 @@ type State = {
 	playlist_cursor: number,
 	sel_playlist: number,
 	sel_queue: number,
+	sel_rec: number,
 	flash: string,
 	flash_until: number,
 }
@@ -72,6 +73,10 @@ type Block = {
 	blob: string?,
 	blob_key: string?,
 	resend_at: number?,
+	-- Covers of the recommendation cards, one blob per track url; the hero
+	-- keeps using blob/blob_key above.
+	covers: { [string]: string },
+	covers_seq: number,
 	rendered: string,
 	searching: boolean,
 	search_seq: number,
@@ -184,6 +189,27 @@ local function share_art(): ()
 			block.blob_key = art.key
 			block.rendered = ""
 		end
+	end
+end
+
+-- Sends the covers of the recommendation cards as blobs, one per track url;
+-- missing covers start fetching, so every poll brings new cards to life.
+local function share_covers(block: Block, wanted: { string }): ()
+	local changed = false
+	for _, url in wanted do
+		if block.covers[url] == nil then
+			local bytes, mime = player.cover_of(url)
+			if bytes ~= nil then
+				block.covers[url] = block.context:blob(bytes, mime or "image/jpeg")
+				changed = true
+			else
+				player.prefetch_cover(url)
+			end
+		end
+	end
+	if changed then
+		block.covers_seq += 1
+		block.rendered = ""
 	end
 end
 
@@ -700,9 +726,11 @@ local function hero(block: Block, p: yt.Player?, cx: BlockCx): Node
 		track = queue[p.index + 1]
 	end
 	local art = player.art()
+	local narrow = cx.cols < 64
+	local cover_size = if narrow then 144 else 220
 	local cover: Node
 	if block.blob ~= nil and art.key ~= nil and block.blob_key == art.key then
-		cover = with(ui.node("image", { blob = block.blob, alt = "Cover", w = 176, h = 176 }), {
+		cover = with(ui.node("image", { blob = block.blob, alt = "Cover", w = cover_size, h = cover_size }), {
 			key = "art",
 			role = "ytm-cover",
 		})
@@ -729,7 +757,6 @@ local function hero(block: Block, p: yt.Player?, cx: BlockCx): Node
 	end
 	table.insert(meta, badge_row(p))
 	local kids: { Node } = { cover, with(ui.col(meta), { key = "meta", grow = 1 }) }
-	local narrow = cx.cols < 64
 	return with(if narrow then ui.col(kids) else ui.row(kids), {
 		key = "hero",
 		role = if narrow then "ytm-hero ytm-hero-narrow" else "ytm-hero",
@@ -928,6 +955,72 @@ local function queue_section(state: State, p: yt.Player?): Node
 	return with(ui.section(head, { list }), { key = "queue", role = "ytm-queue", collapsible = true })
 end
 
+-- Recommendations --------------------------------------------------------
+
+local function rec_card(block: Block, index: number, track: Track, selected: boolean): Node
+	local cover: Node
+	local blob = block.covers[track.url]
+	if blob ~= nil then
+		cover = with(ui.node("image", { blob = blob, alt = "", w = 120, h = 120 }), {
+			key = "c",
+			role = "ytm-rec-cover",
+		})
+	else
+		cover = with(ui.node("icon", { name = "wave" }), { key = "c", role = "ytm-rec-cover ytm-rec-cover-empty" })
+	end
+	local lines: { Node } = {
+		cover,
+		with(ui.text({ ui.span(yt.cut(if track.title ~= "" then track.title else track.url, 40), "strong") }), {
+			key = "t",
+			role = "ytm-rec-title",
+		}),
+	}
+	if track.artist ~= "" then
+		table.insert(lines, with(ui.text({ ui.span(yt.cut(track.artist, 40), "muted") }), {
+			key = "a",
+			role = "ytm-rec-artist",
+		}))
+	end
+	return with(ui.col(lines), {
+		key = "c" .. tostring(index),
+		role = "ytm-rec" .. if selected then " ytm-rec-selected" else "",
+		actions = { click = "rec=" .. tostring(index), dblclick = "recq=" .. tostring(index) },
+	})
+end
+
+local function recommendations_section(block: Block, state: State): Node
+	local recs = player.recommendations()
+	local loading, recs_message = player.recommendations_status()
+	local selected = math.clamp(state.sel_rec, 1, math.max(#recs, 1))
+	local cards: { Node } = {}
+	for index, track in recs do
+		table.insert(cards, rec_card(block, index, track, index == selected))
+	end
+	local body: { Node } = {}
+	table.insert(body, with(ui.row({
+		clickable(ui.badge("Refresh", "muted"), "refresh-recs", "ytm-rec-refresh"),
+		ui.text({ ui.span("click plays · double-click queues", "dim") }),
+	}), { key = "toolbar", role = "ytm-rec-toolbar" }))
+	if #cards > 0 then
+		table.insert(body, with(ui.row(cards), { key = "cards", role = "ytm-rec-cards" }))
+	end
+	if recs_message ~= "" then
+		table.insert(body, ui.text({ ui.span(recs_message, "muted") }))
+	elseif #cards == 0 and loading then
+		table.insert(body, ui.text({ ui.span("Picking recommendations…", "muted") }))
+	elseif #cards == 0 then
+		table.insert(
+			body,
+			ui.text({ ui.span("Play a few tracks — recommendations from your history appear here", "muted") })
+		)
+	end
+	local head: { Span } = { ui.span("Recommended", "strong") }
+	if loading then
+		table.insert(head, ui.span("  refreshing", "muted"))
+	end
+	return with(ui.section(head, body), { key = "recs", role = "ytm-recs", collapsible = true })
+end
+
 local function playlists_section(state: State): Node
 	local saved = player.playlists()
 	local items: { Item } = {}
@@ -1087,6 +1180,7 @@ end
 
 local function signature(block: Block): string
 	local p = shown(block)
+	local recs_loading, recs_message = player.recommendations_status()
 	local parts: { string } = {
 		if p == nil then "none" else p.state,
 		tostring(if p == nil then 0 else p.pos // 1),
@@ -1113,6 +1207,7 @@ local function signature(block: Block): string
 		tostring(#block.state.results),
 		tostring(block.state.sel_search),
 		tostring(block.state.sel_queue),
+		tostring(block.state.sel_rec),
 		block.state.artist_filter,
 		tostring(block.state.artist_cursor),
 		block.state.duration_filter,
@@ -1127,6 +1222,11 @@ local function signature(block: Block): string
 		block.state.flash,
 		tostring(block.searching),
 		tostring(block.blob_key),
+		tostring(block.covers_seq),
+		tostring(player.recommendations_version()),
+		tostring(recs_loading),
+		recs_message,
+		tostring(#player.history()),
 		tostring(player.problem()),
 		tostring(player.is_running()),
 	}
@@ -1145,7 +1245,10 @@ local function poll_once(): boolean
 			blocks[pane] = nil
 		end
 	end
-	local keep_alive = player.autoplay() and (player.is_running() or player.state() ~= nil)
+	-- With no visible blocks the loop still doubles as the plugin's daemon
+	-- while mpv runs: it records listening history and refreshes the
+	-- recommendations; it stops once the player is gone.
+	local keep_alive = player.is_running() or player.state() ~= nil
 	if next(blocks) == nil and not keep_alive then
 		return false
 	end
@@ -1166,6 +1269,18 @@ local function poll_once(): boolean
 		end
 	end
 	queue = player.queue()
+	-- Covers of the recommendation cards: missing ones start fetching, the
+	-- ready ones are sent as blobs.
+	local recs = player.recommendations()
+	if #recs > 0 then
+		local wanted: { string } = {}
+		for _, track in recs do
+			table.insert(wanted, track.url)
+		end
+		for _, block in blocks do
+			share_covers(block, wanted)
+		end
+	end
 	local now = tern.now()
 	for _, block in blocks do
 		if block.state.flash_until > 0 and now > block.state.flash_until then
@@ -1405,6 +1520,21 @@ local function on_action(block: Block, state: State, act: string, raw: string?):
 		enqueue_selected_playlist(block)
 	elseif act == "delete-playlist" then
 		delete_playlist(block)
+	elseif act == "refresh-recs" then
+		player.refresh_recommendations()
+		say(block, "Refreshing recommendations…")
+	elseif raw ~= nil and act == "rec" then
+		local recs = player.recommendations()
+		local track = recs[tonumber(raw) or 0]
+		if track ~= nil then
+			play_track(block, track)
+		end
+	elseif raw ~= nil and act == "recq" then
+		local recs = player.recommendations()
+		local track = recs[tonumber(raw) or 0]
+		if track ~= nil then
+			enqueue_track(block, track)
+		end
 	elseif raw ~= nil and act == "open" then
 		local result = filtered_results(state)[tonumber(raw) or 0]
 		if result ~= nil then
@@ -1448,6 +1578,7 @@ local player_block: BlockDef<State> = {
 			playlist_cursor = 0,
 			sel_playlist = 1,
 			sel_queue = 1,
+			sel_rec = 1,
 			flash = "",
 			flash_until = 0,
 		}
@@ -1503,6 +1634,8 @@ local player_block: BlockDef<State> = {
 			blob = nil,
 			blob_key = nil,
 			resend_at = nil,
+			covers = {},
+			covers_seq = 0,
 			rendered = "",
 			searching = false,
 			search_seq = 0,
@@ -1565,6 +1698,7 @@ local player_block: BlockDef<State> = {
 		table.insert(children, hero(block, p, cx))
 		table.insert(children, progress_row(p))
 		table.insert(children, control_row(p))
+		table.insert(children, recommendations_section(block, state))
 		table.insert(children, search_section(block, state))
 		table.insert(children, queue_section(state, p))
 		table.insert(children, playlists_section(state))

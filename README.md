@@ -2,10 +2,11 @@
 
 A YouTube Music and SoundCloud player for [Tern](https://stencil.so/tern): a
 native block with cover art, playback controls, a queue, merged search across
-both catalogs for tracks, artists, playlists and podcasts, related-track
-autoplay that crosses sources, automatic replacement of failed tracks from the
-other source, saved playlists, plus palette commands, a status-line segment and
-a route for clicked track links.
+both catalogs for tracks, artists, playlists and podcasts, a recommendations
+row built from your listening history, related-track autoplay that crosses
+sources, automatic replacement of failed tracks from the other source, saved
+playlists, plus palette commands, a status-line segment and a route for
+clicked track links.
 
 Playback runs through `mpv --idle` in the background — no browser, no ads, no
 video, nothing to keep on screen — and the block is a view of it: closing the
@@ -111,6 +112,22 @@ versa. Two attempts per URL keep a permanently broken link from cycling; after
 that (or if nothing else is found) the queue resumes where it was. Any user
 command — jumping, next, play — abandons a pending replacement.
 
+### Recommendations
+
+Between the controls and the search area sits **Recommended**: up to twelve
+tracks with cover art, built from your listening history. A track enters the
+history once it has played for ten seconds — skips and false starts never
+count — and a replay moves it back to the front. The last twenty heard tracks
+persist in the key/value store (`history`); recommendations take the first four
+distinct ones as seeds and collect their related lists (the same cross-source
+ladder the autoplay uses), skipping anything already heard or queued.
+
+**click** plays a card, **double-click** adds it to the queue, **Refresh**
+rebuilds the row. The recommendations refresh themselves whenever the history
+changes, and the poll loop keeps recording and rebuilding even with no block
+open, as long as the player runs. An empty row simply means "play a few
+tracks".
+
 The public YouTube Music search/recommendation API is undocumented and can
 change; the implementation follows the community-maintained
 [ytmusicapi search reference](https://ytmusicapi.readthedocs.io/en/stable/reference/search.html).
@@ -147,6 +164,7 @@ on the next play (or when a block is opened).
 | `<data>/kv.json`    | `volume`        | the volume a new player starts at          |
 | `<data>/kv.json`    | `autoplay`     | similar-track autoplay, managed by the player UI |
 | `<data>/kv.json`    | `playlists`    | saved playlists, managed by the player UI        |
+| `<data>/kv.json`    | `history`      | listening history, managed by the player UI      |
 
 The plugin does not need the variables: it looks for each tool in
 `TERN_YT_*`, then the kv key, then `PATH`, then the places installers that do

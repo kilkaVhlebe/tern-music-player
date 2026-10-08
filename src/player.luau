@@ -19,13 +19,20 @@ local PLAYLIST_TRACK_LIMIT = 200
 local AUTOPLAY_REMAINING = 3
 local AUTOPLAY_ADD_LIMIT = 8
 local AUTOPLAY_SEEN_LIMIT = 500
+local RECS_SEEDS = 4
+local RECS_LIMIT = 12
 local MERGE_TOLERANCE_S = 5
 local RELATED_TOLERANCE_S = 20
 local FALLBACK_ATTEMPT_LIMIT = 2
 local FALLBACK_SEEN_LIMIT = 200
 local PLAYLISTS_KEY = "playlists"
 local AUTOPLAY_KEY = "autoplay"
-local ART_MAX = 8
+local HISTORY_KEY = "history"
+local HISTORY_LIMIT = 20
+-- A track counts as heard after this much accumulated playing time; short
+-- skips and false starts never reach the history or shape the recommendations.
+local HISTORY_PLAY_SECONDS = 10
+local ART_MAX = 24
 
 export type Track = {
 	url: string,
@@ -54,9 +61,12 @@ local spawned_at = -math.huge
 local tool_problem: string? = nil
 local tools_checked = false
 local pending: { Pending } = {}
-local art: { key: string?, bytes: string?, mime: string?, loading: string? } = {}
+local art: { key: string?, bytes: string?, mime: string? } = {}
 local art_cache: { [string]: { bytes: string, mime: string } } = {}
 local art_order: { string } = {}
+-- Covers currently being fetched, so the same url is never requested twice
+-- and concurrent fetches (hero + recommendation cards) do not clash.
+local cover_loading: { [string]: boolean } = {}
 local preferences_loaded = false
 local preferences_error: string? = nil
 local autoplay_enabled = true
@@ -104,6 +114,17 @@ end
 
 local playlists: { Playlist } = {}
 local tick_autoplay: (() -> ())? = nil
+local tick_recs: (() -> ())? = nil
+
+-- Listening history: the last tracks that played long enough to count, newest
+-- first; it persists across restarts and feeds the recommendations.
+local history: { Track } = {}
+local history_version = 0
+-- Accumulated playing time of the current url, for the >= HISTORY_PLAY_SECONDS
+-- rule; `history_url` is the track being timed, `history_acc` its seconds.
+local history_url: string? = nil
+local history_acc = 0
+local history_last_at = 0
 
 -- Called when something the views show changed outside a poll: the player
 -- starting or exiting, a tool check failing, a cover arriving.
@@ -150,21 +171,34 @@ local function load_preferences(): ()
 		preferences_error = tostring(saved_playlists)
 		return
 	end
-	if type(saved_playlists) ~= "table" then
-		return
-	end
-	for _, saved in saved_playlists do
-		if type(saved) == "table" and type(saved.name) == "string" and type(saved.tracks) == "table" then
-			local tracks: { Track } = {}
-			for _, value in saved.tracks do
-				local track = track_from(value)
-				if track ~= nil then
-					table.insert(tracks, track)
+	if type(saved_playlists) == "table" then
+		for _, saved in saved_playlists do
+			if type(saved) == "table" and type(saved.name) == "string" and type(saved.tracks) == "table" then
+				local tracks: { Track } = {}
+				for _, value in saved.tracks do
+					local track = track_from(value)
+					if track ~= nil then
+						table.insert(tracks, track)
+					end
+				end
+				if #tracks > 0 and #playlists < PLAYLIST_LIMIT then
+					table.insert(playlists, { name = saved.name, tracks = tracks })
 				end
 			end
-			if #tracks > 0 and #playlists < PLAYLIST_LIMIT then
-				table.insert(playlists, { name = saved.name, tracks = tracks })
-			end
+		end
+	end
+	local history_ok, saved_history = pcall(tern.kv.get, HISTORY_KEY)
+	if not history_ok then
+		preferences_error = tostring(saved_history)
+		return
+	end
+	if type(saved_history) ~= "table" then
+		return
+	end
+	for _, value in saved_history do
+		local track = track_from(value)
+		if track ~= nil and #history < HISTORY_LIMIT then
+			table.insert(history, track)
 		end
 	end
 end
@@ -217,6 +251,37 @@ end
 function player.playlists(): { Playlist }
 	load_preferences()
 	return playlists
+end
+
+-- The last heard tracks, newest first; the recommendations read this.
+function player.history(): { Track }
+	load_preferences()
+	return history
+end
+
+-- Rises whenever the history changes, so the recommendations know to refresh.
+function player.history_version(): number
+	load_preferences()
+	return history_version
+end
+
+-- Moves a track to the front of the history (a replay counts as heard again),
+-- caps it and persists; called once per track by the poll's recorder.
+local function remember_play(track: Track): ()
+	local next_history: { Track } = { track }
+	for _, entry in history do
+		if entry.url ~= track.url and #next_history < HISTORY_LIMIT then
+			table.insert(next_history, entry)
+		end
+	end
+	local ok = pcall(tern.kv.set, HISTORY_KEY, next_history)
+	if not ok then
+		-- A full disk must not stop the player; the next track tries again.
+		return
+	end
+	history = next_history
+	history_version += 1
+	notify()
 end
 
 function player.save_playlist(name: string, tracks: { Track }): (boolean, string?)
@@ -454,6 +519,55 @@ function player.request(name: string, ...: string): ()
 	)
 end
 
+-- Watches the playing track and, once it has played HISTORY_PLAY_SECONDS,
+-- adds it to the listening history. Paused time and long poll gaps do not
+-- count, so a skipped or briefly poked track never becomes a play.
+local function tick_history(): ()
+	load_preferences()
+	local state = current
+	if state == nil or state.url == "" then
+		history_url = nil
+		history_acc = 0
+		return
+	end
+	local now = tern.now()
+	if history_url ~= state.url then
+		history_url = state.url
+		history_acc = 0
+		history_last_at = now
+		return
+	end
+	local gap = (now - history_last_at) / 1000
+	history_last_at = now
+	if state.state ~= "playing" or gap < 0 or gap > 5 then
+		return
+	end
+	if history_acc >= math.huge then
+		-- Already recorded for this url; the next track starts fresh.
+		return
+	end
+	history_acc += gap
+	if history_acc < HISTORY_PLAY_SECONDS then
+		return
+	end
+	local row: yt.Flat? = queue[state.index + 1]
+	local title = if state.title ~= "" then state.title else if row == nil then "" else row.title
+	if title == "" then
+		-- Metadata arrives a moment after playback starts; wait for it.
+		return
+	end
+	local artist = if state.artist ~= "" then state.artist else if row == nil then "" else row.artist
+	-- math.huge: recorded for this url; a replay starts a fresh timing.
+	history_acc = math.huge
+	remember_play({
+		url = state.url,
+		video = state.video,
+		title = title,
+		artist = artist,
+		duration = state.duration,
+	})
+end
+
 -- Reads the files the bridge wrote. Returns the fresh state, if any.
 function player.poll(): yt.Player?
 	local latest = yt.read()
@@ -475,6 +589,10 @@ function player.poll(): yt.Player?
 		end
 	end
 	queue = if current == nil then {} else yt.queue()
+	tick_history()
+	if tick_recs ~= nil then
+		tick_recs()
+	end
 	if tick_autoplay ~= nil then
 		tick_autoplay()
 	end
@@ -661,14 +779,15 @@ end
 -- related list directly; a SoundCloud track first looks for its YouTube twin
 -- (that related list is far better) and, when there is none, adds SoundCloud
 -- results for the same title and artist.
-local function related_for(state: yt.Player, row: yt.Flat?, done: (tracks: { Track }, err: string?) -> ()): ()
-	if state.video ~= "" then
-		player.related(state.video, done)
+local function related_for_track(seed: Track, done: (tracks: { Track }, err: string?) -> ()): ()
+	if seed.video ~= "" then
+		player.related(seed.video, done)
 		return
 	end
-	local title = if state.title ~= "" then state.title else if row == nil then "" else row.title
-	local artist = if row == nil then "" else row.artist
-	local query = string.match(title .. if artist ~= "" then " " .. artist else "", "^%s*(.-)%s*$") or ""
+	local query = string.match(
+		seed.title .. if seed.artist ~= "" then " " .. seed.artist else "",
+		"^%s*(.-)%s*$"
+	) or ""
 	if query == "" then
 		done({}, nil)
 		return
@@ -691,8 +810,8 @@ local function related_for(state: yt.Player, row: yt.Flat?, done: (tracks: { Tra
 		for _, item in items do
 			if item.video ~= ""
 				and item.duration ~= nil
-				and state.duration ~= nil
-				and math.abs((item.duration :: number) - (state.duration :: number)) <= RELATED_TOLERANCE_S
+				and seed.duration ~= nil
+				and math.abs((item.duration :: number) - (seed.duration :: number)) <= RELATED_TOLERANCE_S
 			then
 				player.related(item.video, done)
 				return
@@ -700,6 +819,134 @@ local function related_for(state: yt.Player, row: yt.Flat?, done: (tracks: { Tra
 		end
 		from_soundcloud(nil)
 	end)
+end
+
+local function related_for(state: yt.Player, row: yt.Flat?, done: (tracks: { Track }, err: string?) -> ()): ()
+	local seed: Track = {
+		url = if row == nil then state.url else row.url,
+		video = state.video,
+		title = if state.title ~= "" then state.title else if row == nil then "" else row.title,
+		artist = if row == nil then "" else row.artist,
+		duration = state.duration,
+	}
+	related_for_track(seed, done)
+end
+
+-- Recommendations from the listening history --------------------------------
+--
+-- Up to RECS_LIMIT tracks: the related lists of the first RECS_SEEDS distinct
+-- history tracks, in history order, skipping anything already heard or queued.
+-- One generation per build, so a manual refresh or a history change mid-fetch
+-- drops the older work; a SoundCloud seed uses the same twin-search ladder as
+-- the autoplay above.
+
+local recs: { Track } = {}
+local recs_version = 0
+local recs_loading = false
+local recs_message = ""
+local recs_generation = 0
+-- The history_version the current recommendations were built for; -1 forces
+-- the next poll to rebuild (the manual refresh button).
+local recs_built_for = -1
+
+local function build_recommendations(): ()
+	if recs_loading then
+		return
+	end
+	load_preferences()
+	local seeds: { Track } = {}
+	local seed_seen: { [string]: boolean } = {}
+	for _, entry in history do
+		if not seed_seen[entry.url] and #seeds < RECS_SEEDS then
+			seed_seen[entry.url] = true
+			table.insert(seeds, entry)
+		end
+	end
+	recs_built_for = history_version
+	if #seeds == 0 then
+		recs = {}
+		recs_message = ""
+		recs_version += 1
+		notify()
+		return
+	end
+	recs_loading = true
+	recs_message = "Picking recommendations…"
+	recs_generation += 1
+	local generation = recs_generation
+	local collected: { Track } = {}
+	local seen: { [string]: boolean } = {}
+	local excluded: { [string]: boolean } = {}
+	for _, entry in history do
+		excluded[entry.url] = true
+	end
+	for _, queued in queue do
+		excluded[queued.url] = true
+	end
+	local seed_index = 0
+	local failures = 0
+	local function step(): ()
+		if generation ~= recs_generation then
+			return
+		end
+		seed_index += 1
+		local seed = seeds[seed_index]
+		if seed == nil then
+			recs_loading = false
+			recs = collected
+			recs_message = if #collected == 0 and failures > 0 then "No recommendations found" else ""
+			notify()
+			return
+		end
+		related_for_track(seed, function(tracks: { Track }, err: string?)
+			if generation ~= recs_generation then
+				return
+			end
+			if err ~= nil then
+				failures += 1
+			end
+			for _, track in tracks do
+				if #collected >= RECS_LIMIT then
+					break
+				end
+				if not seen[track.url] and not excluded[track.url] then
+					seen[track.url] = true
+					table.insert(collected, track)
+				end
+			end
+			step()
+		end)
+	end
+	notify()
+	step()
+end
+
+tick_recs = function(): ()
+	load_preferences()
+	if not recs_loading and recs_built_for ~= history_version then
+		build_recommendations()
+	end
+end
+
+function player.recommendations(): { Track }
+	return recs
+end
+
+function player.recommendations_status(): (boolean, string)
+	return recs_loading, recs_message
+end
+
+-- Rises with every finished build, so blocks re-render when results change.
+function player.recommendations_version(): number
+	return recs_version
+end
+
+function player.refresh_recommendations(): ()
+	-- Cancels any in-flight build; the poll below rebuilds right away.
+	recs_generation += 1
+	recs_loading = false
+	recs_built_for = -1
+	build_recommendations()
 end
 
 tick_autoplay = function(): ()
@@ -966,21 +1213,20 @@ local function store_cover(url: string, body: string, header: string?): ()
 			art_cache[evicted] = nil
 		end
 	end
-	art = { key = url, bytes = body, mime = mime }
 end
 
-local function fetch_cover(url: string, image: string, arrived: () -> ()): ()
+local function fetch_cover(url: string, image: string, done: () -> ()): ()
 	tern.fetch(image, { timeout_ms = 15000 }, function(response: FetchResult, _cx)
-		if art.loading ~= url then
+		if not cover_loading[url] then
 			return
 		end
-		art.loading = nil
+		cover_loading[url] = nil
 		if response.error ~= nil or response.status ~= 200 then
 			art_cache[url] = { bytes = "", mime = "" }
 			return
 		end
 		store_cover(url, response.body, response.headers["content-type"])
-		arrived()
+		done()
 	end)
 end
 
@@ -993,19 +1239,19 @@ end
 -- SoundCloud tracks have no video id to build a thumbnail from, so ask its
 -- oEmbed endpoint for the artwork of the track URL — no client id, and it
 -- works after a plugin reload — unless search already reported the artwork.
-local function fetch_soundcloud_cover(url: string, arrived: () -> ()): ()
+local function fetch_soundcloud_cover(url: string, done: () -> ()): ()
 	local hint = art_hints[url]
 	if hint ~= nil then
-		fetch_cover(url, hint, arrived)
+		fetch_cover(url, hint, done)
 		return
 	end
 	local endpoint = "https://soundcloud.com/oembed?format=json&url=" .. urlencode(url)
 	tern.fetch(endpoint, { timeout_ms = 15000 }, function(response: FetchResult, _cx)
-		if art.loading ~= url then
+		if not cover_loading[url] then
 			return
 		end
 		if response.error ~= nil or response.status ~= 200 or response.body == "" then
-			art.loading = nil
+			cover_loading[url] = nil
 			art_cache[url] = { bytes = "", mime = "" }
 			return
 		end
@@ -1015,17 +1261,53 @@ local function fetch_soundcloud_cover(url: string, arrived: () -> ()): ()
 			thumbnail = document.thumbnail_url :: string
 		end
 		if thumbnail == "" then
-			art.loading = nil
+			cover_loading[url] = nil
 			art_cache[url] = { bytes = "", mime = "" }
 			return
 		end
 		remember_art(url, thumbnail)
-		fetch_cover(url, thumbnail, arrived)
+		fetch_cover(url, thumbnail, done)
 	end)
 end
 
--- Fetches the artwork of the track at `url` once and calls `arrived` when
--- the module's current art changed, so the blocks can re-send it as a blob.
+-- Fetches the cover of `url` once into the cache (failed ones are remembered
+-- as empty and never re-asked) and calls `done` when the bytes are there.
+-- Fetches only; the current art is `load_cover`'s job, so several covers can
+-- load side by side for the hero and the recommendation cards.
+local function ensure_cover(url: string, done: () -> ()): ()
+	if url == "" then
+		return
+	end
+	local cached = art_cache[url]
+	if cached ~= nil then
+		if cached.bytes ~= "" then
+			done()
+		end
+		return
+	end
+	if cover_loading[url] then
+		return
+	end
+	cover_loading[url] = true
+	local source = yt.source_of(url)
+	if source == "soundcloud" then
+		fetch_soundcloud_cover(url, done)
+		return
+	end
+	if source == "youtube" then
+		local video = yt.youtube_id(url)
+		if video ~= nil then
+			fetch_cover(url, yt.thumb(video), done)
+			return
+		end
+	end
+	-- A pasted link from a service without artwork here: fail once.
+	cover_loading[url] = nil
+	art_cache[url] = { bytes = "", mime = "" }
+end
+
+-- Fetches the artwork of the track at `url` once and makes it the current
+-- art, so the blocks re-send it as a blob; an empty cover shows the placeholder.
 function player.load_cover(url: string, arrived: () -> ()): ()
 	if url == "" then
 		return
@@ -1034,7 +1316,10 @@ function player.load_cover(url: string, arrived: () -> ()): ()
 	if cached ~= nil then
 		if cached.bytes == "" then
 			-- Artwork that failed before: do not ask for it every poll.
-			art.key = url
+			if art.key ~= url then
+				art = { key = url, bytes = nil, mime = nil }
+				arrived()
+			end
 			return
 		end
 		if art.key ~= url then
@@ -1043,26 +1328,35 @@ function player.load_cover(url: string, arrived: () -> ()): ()
 		end
 		return
 	end
-	if art.key == url or art.loading == url then
-		return
+	if art.key ~= url then
+		art = { key = url, bytes = nil, mime = nil }
 	end
-	art.key = url
-	art.loading = url
-	local source = yt.source_of(url)
-	if source == "soundcloud" then
-		fetch_soundcloud_cover(url, arrived)
-		return
-	end
-	if source == "youtube" then
-		local video = yt.youtube_id(url)
-		if video ~= nil then
-			fetch_cover(url, yt.thumb(video), arrived)
+	ensure_cover(url, function()
+		if art.key ~= url then
 			return
 		end
+		local fresh = art_cache[url]
+		if fresh ~= nil and fresh.bytes ~= "" then
+			art = { key = url, bytes = fresh.bytes, mime = fresh.mime }
+			arrived()
+		end
+	end)
+end
+
+-- Starts fetching the cover of `url` into the cache without making it the
+-- current art (for the recommendation cards); cheap to call every poll.
+function player.prefetch_cover(url: string): ()
+	ensure_cover(url, function() end)
+end
+
+-- The cached cover bytes of `url` (nil until fetched, and nil for covers that
+-- failed or are not known here), so a block can send them as a blob.
+function player.cover_of(url: string): (string?, string?)
+	local cached = art_cache[url]
+	if cached == nil or cached.bytes == "" then
+		return nil, nil
 	end
-	-- A pasted link from a service without artwork here: fail once.
-	art.loading = nil
-	art_cache[url] = { bytes = "", mime = "" }
+	return cached.bytes, cached.mime
 end
 
 return player
