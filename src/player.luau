@@ -19,8 +19,16 @@ local PLAYLIST_TRACK_LIMIT = 200
 local AUTOPLAY_REMAINING = 3
 local AUTOPLAY_ADD_LIMIT = 8
 local AUTOPLAY_SEEN_LIMIT = 500
-local RECS_SEEDS = 4
+-- How many tracks of one artist an autoplay batch may contain before the
+-- assembler moves on to the genre neighbours deeper in the related list.
+local AUTOPLAY_ARTIST_CAP = 3
+local RECS_SEEDS = 5
 local RECS_LIMIT = 12
+-- The same cap idea for the recommendations row: two tracks per artist keep
+-- one performer from swallowing the feed.
+local RECS_ARTIST_CAP = 2
+-- Radio-playlist probes for the first N seeds; each costs two requests.
+local RECS_PLAYLIST_PROBES = 2
 local MERGE_TOLERANCE_S = 5
 local RELATED_TOLERANCE_S = 20
 local FALLBACK_ATTEMPT_LIMIT = 2
@@ -832,13 +840,124 @@ local function related_for(state: yt.Player, row: yt.Flat?, done: (tracks: { Tra
 	related_for_track(seed, done)
 end
 
+-- Feed assembly -----------------------------------------------------------
+--
+-- The related list of one track starts with that performer's own songs and
+-- only further down reaches genre neighbours. Taking such a list head-first
+-- collapses a feed into a single artist; the assembler instead interleaves
+-- several pools round-robin and caps how many tracks one artist may contribute,
+-- so the deeper, more diverse part of every pool gets its turn.
+
+local function normalize_artist(name: string): string
+	local lowered = string.lower(name)
+	-- Auto-generated uploads read "Artist - Topic"; the suffix is noise here.
+	lowered = string.gsub(lowered, "%s*%-?%s*topic%s*$", "")
+	local collapsed = string.gsub(lowered, "%s+", " ")
+	return (string.gsub(collapsed, "^%s*(.-)%s*$", "%1"))
+end
+
+-- Builds up to `limit` tracks from `pools`: one track from each pool in turn,
+-- skipping urls in `excluded` and, once an artist has contributed
+-- `artist_cap` tracks, that artist's remaining tracks until the caps of the
+-- others catch up. Empty artist names never hit the cap (they cannot be
+-- grouped).
+local function assemble_feed(
+	pools: { { Track } },
+	limit: number,
+	artist_cap: number,
+	excluded: { [string]: boolean }
+): { Track }
+	local feed: { Track } = {}
+	local taken: { [string]: boolean } = {}
+	local artist_counts: { [string]: number } = {}
+	local cursors: { number } = {}
+	for _ in pools do
+		table.insert(cursors, 1)
+	end
+	local remaining = limit
+	local active = true
+	while active and remaining > 0 do
+		active = false
+		for pool_index, pool in pools do
+			if remaining <= 0 then
+				break
+			end
+			local cursor = cursors[pool_index]
+			local track = pool[cursor]
+			if track ~= nil then
+				cursors[pool_index] = cursor + 1
+				active = true
+				if track.url ~= "" and taken[track.url] ~= true and excluded[track.url] ~= true then
+					local artist = normalize_artist(track.artist)
+					if artist ~= "" and (artist_counts[artist] or 0) >= artist_cap then
+						continue
+					end
+					taken[track.url] = true
+					if artist ~= "" then
+						artist_counts[artist] = (artist_counts[artist] or 0) + 1
+					end
+					table.insert(feed, track)
+					remaining -= 1
+				end
+			end
+		end
+	end
+	return feed
+end
+
+-- A fan-made radio mix for the seed's artist: search the playlist category
+-- for "<artist> radio", browse the first hit and keep only tracks by *other*
+-- performers — adjacent genres the related lists do not surface. An empty
+-- pool when the artist is unknown or nothing useful turns up.
+local function radio_playlist_pool(seed: Track, done: (tracks: { Track }) -> ()): ()
+	local artist = string.match(seed.artist, "^%s*(.-)%s*$") or ""
+	if artist == "" then
+		done({})
+		return
+	end
+	catalog.search(artist .. " radio", "playlists", function(items: { SearchItem }, err: string?)
+		if err ~= nil then
+			done({})
+			return
+		end
+		local target: string? = nil
+		for _, item in items do
+			if item.kind == "playlist" and item.browse_id ~= "" then
+				target = item.browse_id
+				break
+			end
+		end
+		if target == nil then
+			done({})
+			return
+		end
+		catalog.browse(target, "playlist", function(rows: { SearchItem }, browse_err: string?)
+			if browse_err ~= nil then
+				done({})
+				return
+			end
+			local seed_artist = normalize_artist(artist)
+			local tracks: { Track } = {}
+			for _, row in rows do
+				if row.kind == "track" and row.url ~= "" and normalize_artist(row.artist) ~= seed_artist then
+					table.insert(tracks, to_track(row))
+				end
+			end
+			done(tracks)
+		end)
+	end)
+end
+
 -- Recommendations from the listening history --------------------------------
 --
--- Up to RECS_LIMIT tracks: the related lists of the first RECS_SEEDS distinct
--- history tracks, in history order, skipping anything already heard or queued.
--- One generation per build, so a manual refresh or a history change mid-fetch
--- drops the older work; a SoundCloud seed uses the same twin-search ladder as
--- the autoplay above.
+-- Up to RECS_LIMIT tracks assembled from several pools: the related list of
+-- each seed track (up to RECS_SEEDS history tracks, one per performer) plus a
+-- radio-playlist probe for the first RECS_PLAYLIST_PROBES seeds. Pools are
+-- interleaved round-robin and capped at RECS_ARTIST_CAP tracks per artist, so
+-- the row reads as a mixed feed instead of one performer's bubble; anything
+-- already heard or queued is skipped. One generation per build, so a manual
+-- refresh or a history change mid-fetch drops the older work; a SoundCloud
+-- seed uses the same twin-search ladder as the autoplay above.
 
 local recs: { Track } = {}
 local recs_version = 0
@@ -854,11 +973,17 @@ local function build_recommendations(): ()
 		return
 	end
 	load_preferences()
+	-- One seed per performer: several tracks of the same artist would only
+	-- re-derive one related bubble from different entry points.
 	local seeds: { Track } = {}
-	local seed_seen: { [string]: boolean } = {}
+	local seed_artists: { [string]: boolean } = {}
 	for _, entry in history do
-		if not seed_seen[entry.url] and #seeds < RECS_SEEDS then
-			seed_seen[entry.url] = true
+		if #seeds >= RECS_SEEDS then
+			break
+		end
+		local artist = normalize_artist(entry.artist)
+		if seed_artists[artist] ~= true then
+			seed_artists[artist] = true
 			table.insert(seeds, entry)
 		end
 	end
@@ -874,8 +999,7 @@ local function build_recommendations(): ()
 	recs_message = "Picking recommendations…"
 	recs_generation += 1
 	local generation = recs_generation
-	local collected: { Track } = {}
-	local seen: { [string]: boolean } = {}
+	local pools: { { Track } } = {}
 	local excluded: { [string]: boolean } = {}
 	for _, entry in history do
 		excluded[entry.url] = true
@@ -885,6 +1009,15 @@ local function build_recommendations(): ()
 	end
 	local seed_index = 0
 	local failures = 0
+	local function finish(): ()
+		if generation ~= recs_generation then
+			return
+		end
+		recs_loading = false
+		recs = assemble_feed(pools, RECS_LIMIT, RECS_ARTIST_CAP, excluded)
+		recs_message = if #recs == 0 and failures > 0 then "No recommendations found" else ""
+		notify()
+	end
 	local function step(): ()
 		if generation ~= recs_generation then
 			return
@@ -892,10 +1025,7 @@ local function build_recommendations(): ()
 		seed_index += 1
 		local seed = seeds[seed_index]
 		if seed == nil then
-			recs_loading = false
-			recs = collected
-			recs_message = if #collected == 0 and failures > 0 then "No recommendations found" else ""
-			notify()
+			finish()
 			return
 		end
 		related_for_track(seed, function(tracks: { Track }, err: string?)
@@ -905,16 +1035,20 @@ local function build_recommendations(): ()
 			if err ~= nil then
 				failures += 1
 			end
-			for _, track in tracks do
-				if #collected >= RECS_LIMIT then
-					break
-				end
-				if not seen[track.url] and not excluded[track.url] then
-					seen[track.url] = true
-					table.insert(collected, track)
-				end
+			table.insert(pools, tracks)
+			-- Radio-playlist probes for the first seeds only: each costs two
+			-- requests, a couple is enough for adjacent genres.
+			if seed_index <= RECS_PLAYLIST_PROBES then
+				radio_playlist_pool(seed, function(probe: { Track })
+					if generation ~= recs_generation then
+						return
+					end
+					table.insert(pools, probe)
+					step()
+				end)
+			else
+				step()
 			end
-			step()
 		end)
 	end
 	notify()
@@ -984,15 +1118,12 @@ tick_autoplay = function(): ()
 	autoplay_message = "Finding related tracks to " .. yt.cut(title, 36)
 	notify()
 
-	related_for(state, seed_row, function(tracks: { Track }, err: string?)
-		if generation ~= autoplay_generation then
-			return
-		end
+	local function context_lost(): boolean
 		local latest_state = current
-		local context_changed = latest_state == nil
+		local lost = latest_state == nil
 			or latest_state.pid ~= seed_pid
 			or #queue ~= #seed_queue
-		if not context_changed then
+		if not lost then
 			for index, row in queue do
 				local original = seed_queue[index]
 				if original == nil
@@ -1002,37 +1133,41 @@ tick_autoplay = function(): ()
 					or row.title ~= original.title
 					or row.artist ~= original.artist
 				then
-					context_changed = true
+					lost = true
 					break
 				end
 			end
 		end
-		if context_changed then
+		return lost
+	end
+
+	-- The most recent history track by another performer: its related list
+	-- pulls the batch out of the current track's bubble when the primary
+	-- pool alone runs short.
+	local other_seed: Track? = nil
+	local current_artist = normalize_artist(if state.artist ~= "" then state.artist else if seed_row == nil then "" else seed_row.artist)
+	for _, entry in history do
+		if entry.url ~= state.url and normalize_artist(entry.artist) ~= current_artist then
+			other_seed = entry
+			break
+		end
+	end
+
+	local function deliver(pools: { { Track } }, excluded: { [string]: boolean }): ()
+		if generation ~= autoplay_generation then
+			return
+		end
+		if context_lost() then
 			invalidate_autoplay()
 			return
 		end
 		autoplay_searching = false
-		if err ~= nil then
-			autoplay_message = "Related-track lookup failed: " .. first_line(err)
-			notify()
-			return
-		end
-
-		local known: { [string]: boolean } = {}
-		for _, row in queue do
-			if row.url ~= "" then
-				known[row.url] = true
-			end
-		end
+		local feed = assemble_feed(pools, AUTOPLAY_ADD_LIMIT, AUTOPLAY_ARTIST_CAP, excluded)
 		local added = 0
-		for _, track in tracks do
-			local seen = autoplay_seen[track.url] == true
-			if track.url ~= "" and known[track.url] ~= true and not seen and added < AUTOPLAY_ADD_LIMIT then
-				request("enqueue", false, track.url, track.video, track.title, track.artist)
-				known[track.url] = true
-				added += 1
-				remember_autoplay(track.url)
-			end
+		for _, track in feed do
+			request("enqueue", false, track.url, track.video, track.title, track.artist)
+			added += 1
+			remember_autoplay(track.url)
 		end
 		if added > 0 then
 			autoplay_message = string.format("Added %d related tracks", added)
@@ -1041,6 +1176,49 @@ tick_autoplay = function(): ()
 		end
 		remember_autoplay(seed_key)
 		notify()
+	end
+
+	related_for(state, seed_row, function(tracks: { Track }, err: string?)
+		if generation ~= autoplay_generation then
+			return
+		end
+		if context_lost() then
+			invalidate_autoplay()
+			return
+		end
+		if err ~= nil then
+			autoplay_searching = false
+			autoplay_message = "Related-track lookup failed: " .. first_line(err)
+			notify()
+			return
+		end
+		-- Queue contents and everything autoplay already added are off-limits.
+		local excluded: { [string]: boolean } = {}
+		for _, row in queue do
+			if row.url ~= "" then
+				excluded[row.url] = true
+			end
+		end
+		for seen_url in autoplay_seen do
+			excluded[seen_url] = true
+		end
+		-- A short primary pool (a thin related list, or its artist already
+		-- capped) is worth widening from another performer's history.
+		local probe = other_seed
+		if probe ~= nil and #assemble_feed({ tracks }, AUTOPLAY_ADD_LIMIT, AUTOPLAY_ARTIST_CAP, excluded) < AUTOPLAY_ADD_LIMIT then
+			related_for_track(probe, function(more: { Track }, _more_err: string?)
+				if generation ~= autoplay_generation then
+					return
+				end
+				if context_lost() then
+					invalidate_autoplay()
+					return
+				end
+				deliver({ tracks, more }, excluded)
+			end)
+			return
+		end
+		deliver({ tracks }, excluded)
 	end)
 end
 

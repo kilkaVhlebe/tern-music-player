@@ -103,7 +103,11 @@ adds up to eight related music results not already queued or recently added:
 YouTube Music's track-related recommendations for YouTube tracks; for a
 SoundCloud track it first looks for the same title and artist on YouTube Music
 and continues from that track's recommendations, falling back to SoundCloud
-search. Toggle it from the **autoplay on/off** chip.
+search. The batch is assembled as a mini-feed: tracks of one performer are
+capped at three, the pools are interleaved, and if the current track's list
+runs short the related list of the most recent history track by another
+performer is mixed in — so autoplay walks into neighbouring genres instead of
+circling one artist. Toggle it from the **autoplay on/off** chip.
 
 If a queued track fails to load, the player pauses the queue in place, looks up
 the same title and artist on the other source and swaps the replacement into
@@ -118,9 +122,16 @@ Between the controls and the search area sits **Recommended**: up to twelve
 tracks with cover art, built from your listening history. A track enters the
 history once it has played for ten seconds — skips and false starts never
 count — and a replay moves it back to the front. The last twenty heard tracks
-persist in the key/value store (`history`); recommendations take the first four
-distinct ones as seeds and collect their related lists (the same cross-source
-ladder the autoplay uses), skipping anything already heard or queued.
+persist in the key/value store (`history`).
+
+The row is assembled as a feed, not a single artist's bubble: seeds are the
+five most recent history tracks, at most one per performer; each seed
+contributes its related list (the same cross-source ladder the autoplay uses),
+and the first two seeds also get a radio-playlist probe — the first
+`<artist> radio` playlist on YouTube Music, keeping only tracks by other
+performers, which pulls in adjacent genres. Pools are interleaved round-robin
+and capped at two tracks per artist, and anything already heard or queued is
+skipped.
 
 **click** plays a card, **double-click** adds it to the queue, **Refresh**
 rebuilds the row. The recommendations refresh themselves whenever the history
