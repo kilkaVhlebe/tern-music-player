@@ -1,4 +1,4 @@
-# tern-youtube-player
+# tern-music-player
 
 A YouTube Music and SoundCloud player for [Tern](https://stencil.so/tern): a
 native block with cover art, playback controls, a queue, merged search across
