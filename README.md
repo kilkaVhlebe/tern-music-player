@@ -1,10 +1,9 @@
 # tern-youtube-player
 
-A YouTube music player for [Tern](https://stencil.so/tern): a native block with
-cover art, playback controls, a queue, similar-track autoplay, saved playlists
-and yt-dlp search with duration and artist filters, plus palette commands, a
-status-line segment and a link route that sends any YouTube link you click
-into the player.
+A YouTube Music player for [Tern](https://stencil.so/tern): a native block with
+cover art, playback controls, a queue, YouTube Music catalog search for tracks,
+artists, playlists and podcasts, related-track autoplay, saved playlists, plus
+palette commands, a status-line segment and a route for clicked YouTube links.
 
 Playback runs through `mpv --idle` in the background — no browser, no ads, no
 video, nothing to keep on screen — and the block is a view of it: closing the
@@ -15,7 +14,7 @@ pane keeps the music playing, reopening finds it where it was.
 - Tern (closed beta), desktop. Blocks and processes do not exist on iOS.
 - [`mpv`](https://mpv.io) 0.33 or newer.
 - [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) — mpv uses it to resolve YouTube
-  URLs and the block uses it for search.
+  URLs for playback.
 
 On Windows, the plugin runs console dependencies through the built-in Windows
 Script Host and Windows PowerShell with console creation disabled. No additional
@@ -46,20 +45,21 @@ keybinds: every command is the action `plugin.ytmusic.<id>`.
 
 ## Using it
 
-The block has **Search**, **Queue** and **Playlists** keyboard modes, shown in
-its dock. **Search** mode starts focused on the query:
+The Search area has four YouTube Music categories: **Tracks**, **Artists**,
+**Playlists** and **Podcasts**. Tracks are filtered to YouTube Music songs;
+ordinary YouTube video search results are never mixed into the catalog.
 
-| Key                 | Does                                      |
-| ------------------- | ----------------------------------------- |
-| type / paste        | search, debounced as you type             |
-| `↑` `↓`             | pick a visible result                     |
-| `enter`             | play the result (replaces the queue)      |
-| double-click a row  | add the result to the queue               |
-| `tab`               | switch to queue keys                      |
+| Key                 | Does                                           |
+| ------------------- | ---------------------------------------------- |
+| type / paste        | search the selected category, debounced        |
+| `↑` `↓`             | pick a visible result                          |
+| `enter`             | play a track or open an artist/list/show        |
+| double-click track  | add it to the queue                            |
+| `tab`               | switch to queue keys                            |
 
-The search toolbar filters the current results by duration (`Any length`,
-under 5 minutes, 5–20 minutes, 20+ minutes) and by artist/channel. Filters are
-local: **Play all** and **Save results** use only the visible matches.
+Opening an artist shows its catalog tracks, opening a playlist loads its songs,
+and opening a podcast shows its episodes. **Tracks** also has local duration and
+artist filters; **Play all** and **Save results** use only visible matches.
 
 **Queue** mode:
 
@@ -92,11 +92,14 @@ the current queue. Saving an existing name (case-insensitive) replaces it.
 Playlists persist in the plugin's key/value store; the library holds up to 40
 playlists with 200 tracks each.
 
-Similar-track autoplay is on by default. It fills the queue when three or fewer
-tracks remain, searching yt-dlp for the current artist/title plus `radio`, and
-adds up to eight tracks not already queued or recently added. Toggle it from
-the **autoplay on/off** chip. This is a YouTube text search, not a dedicated
-audio-similarity or recommendation API.
+Similar-track autoplay is on by default. When three or fewer tracks remain, it
+uses YouTube Music's track-related recommendations and adds up to eight music
+results not already queued or recently added. It no longer uses a generic
+YouTube text search. Toggle it from the **autoplay on/off** chip.
+
+The public YouTube Music search/recommendation API is undocumented and can
+change; the implementation follows the community-maintained
+[ytmusicapi search reference](https://ytmusicapi.readthedocs.io/en/stable/reference/search.html).
 
 Every control is also clickable; the icon rows need no focus. The playlist
 name, artist filter and search query each accept typing and paste.

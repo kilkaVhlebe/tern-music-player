@@ -4,16 +4,15 @@
 -- One mpv per host, started when something first wants to play, kept alive by
 -- the block and outliving it on purpose. This module owns everything between
 -- the plugin and that process: the tools it needs, the files `mpv/bridge.lua`
--- writes, the commands queued for it, yt-dlp search and cover art. The block
+-- writes, the commands queued for it, music-catalog search and cover art. The block
 -- (`src/host.luau`) owns only what is on screen.
 
 local process = require("./process")
 local yt = require("./ytmusic")
+local catalog = require("./catalog")
 
 local TOOL_TIMEOUT_MS = 5000
 local SPAWN_COOLDOWN_MS = 3000
-local SEARCH_TIMEOUT_MS = 30000
-local SEARCH_LIMIT = 20
 local PLAYLIST_LIMIT = 40
 local PLAYLIST_TRACK_LIMIT = 200
 local AUTOPLAY_REMAINING = 3
@@ -30,6 +29,8 @@ export type Track = {
 	artist: string,
 	duration: number?,
 }
+export type SearchCategory = catalog.Category
+export type SearchItem = catalog.Item
 export type Playlist = {
 	name: string,
 	tracks: { Track },
@@ -451,62 +452,56 @@ end
 
 -- Search -----------------------------------------------------------------
 
-local function first_string(candidates: { any }): string
-	for _, candidate in candidates do
-		if type(candidate) == "string" and candidate ~= "" then
-			return candidate
-		end
-	end
-	return ""
-end
+-- YouTube Music catalog -------------------------------------------------
 
-local function parse_search(text: string): { Track }
-	local ok, document = pcall(tern.json.decode, text)
-	if not ok or type(document) ~= "table" then
-		return {}
-	end
-	local entries: any = document.entries
-	if type(entries) ~= "table" then
-		entries = { document }
-	end
-	local tracks: { Track } = {}
-	for _, entry in entries do
-		if type(entry) == "table" and type(entry.id) == "string" and entry.id ~= "" then
-			table.insert(tracks, {
-				url = "https://www.youtube.com/watch?v=" .. entry.id,
-				video = entry.id,
-				title = first_string({ entry.title, entry.id }),
-				artist = first_string({ entry.uploader, entry.channel, entry.creator }),
-				duration = if type(entry.duration) == "number" then entry.duration else nil,
-			})
-		end
-	end
-	return tracks
-end
-
--- Runs one yt-dlp search; `done` gets the results or the first line of why not.
-function player.search(query: string, done: (tracks: { Track }, err: string?) -> ()): ()
-	local ytdlp = yt.ytdlp_bin()
-	local argv = {
-		ytdlp,
-		"-J",
-		"--flat-playlist",
-		"--no-warnings",
-		"ytsearch" .. tostring(SEARCH_LIMIT) .. ":" .. query,
+local function to_track(item: SearchItem): Track
+	return {
+		url = item.url,
+		video = item.video,
+		title = item.title,
+		artist = item.artist,
+		duration = item.duration,
 	}
-	local started, failure = pcall(function(): string?
-		process.run(argv, { timeout_ms = SEARCH_TIMEOUT_MS }, function(result: ProcessResult)
-			if result.status ~= 0 then
-				done({}, first_line(result.stderr))
-				return
-			end
-			done(parse_search(result.stdout), nil)
-		end)
-		return nil
-	end)
-	if not started then
-		done({}, tool_missing(ytdlp, tostring(failure)))
+end
+
+function player.search(query: string, category: SearchCategory, done: (items: { SearchItem }, err: string?) -> ()): ()
+	catalog.search(query, category, done)
+end
+
+function player.open_search_result(item: SearchItem, done: (tracks: { Track }, err: string?) -> ()): ()
+	if item.browse_id == "" then
+		done({}, "This result cannot be opened")
+		return
 	end
+	catalog.browse(item.browse_id, item.kind, function(items: { SearchItem }, err: string?)
+		if err ~= nil then
+			done({}, err)
+			return
+		end
+		local tracks: { Track } = {}
+		for _, result in items do
+			if result.kind == "track" then
+				table.insert(tracks, to_track(result))
+			end
+		end
+		done(tracks, nil)
+	end)
+end
+
+function player.related(video: string, done: (tracks: { Track }, err: string?) -> ()): ()
+	catalog.related(video, function(items: { SearchItem }, err: string?)
+		if err ~= nil then
+			done({}, err)
+			return
+		end
+		local tracks: { Track } = {}
+		for _, result in items do
+			if result.kind == "track" then
+				table.insert(tracks, to_track(result))
+			end
+		end
+		done(tracks, nil)
+	end)
 end
 
 local function remember_autoplay(video: string): ()
@@ -552,20 +547,10 @@ tick_autoplay = function(): ()
 	end
 	local seed = queue[state.index + 1]
 	local title = if state.title ~= "" then state.title else if seed == nil then "" else seed.title
-	local artist = if state.artist ~= "" then state.artist else if seed == nil then "" else seed.artist
-	local terms: { string } = {}
-	if artist ~= "" then
-		table.insert(terms, artist)
-	end
-	if title ~= "" then
-		table.insert(terms, title)
-	end
-	table.insert(terms, "radio")
-	local query = table.concat(terms, " ")
-	autoplay_message = "Finding tracks similar to " .. yt.cut(title, 36)
+	autoplay_message = "Finding related tracks to " .. yt.cut(title, 36)
 	notify()
 
-	player.search(query, function(tracks: { Track }, err: string?)
+	player.related(seed_video, function(tracks: { Track }, err: string?)
 		if generation ~= autoplay_generation then
 			return
 		end
@@ -594,7 +579,7 @@ tick_autoplay = function(): ()
 		end
 		autoplay_searching = false
 		if err ~= nil then
-			autoplay_message = "Autoplay search failed: " .. first_line(err)
+			autoplay_message = "Related-track lookup failed: " .. first_line(err)
 			notify()
 			return
 		end
@@ -616,9 +601,9 @@ tick_autoplay = function(): ()
 			end
 		end
 		if added > 0 then
-			autoplay_message = string.format("Added %d similar tracks", added)
+			autoplay_message = string.format("Added %d related tracks", added)
 		else
-			autoplay_message = "No new similar tracks found"
+			autoplay_message = "No new related tracks found"
 		end
 		remember_autoplay(seed_video)
 		notify()

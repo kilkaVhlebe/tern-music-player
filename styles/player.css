@@ -140,7 +140,8 @@
 	gap: 5px;
 }
 
-.sf-main[data-surface='plugin.ytmusic.player'] [data-role~='ytm-filter-chip'] {
+.sf-main[data-surface='plugin.ytmusic.player'] [data-role~='ytm-filter-chip'],
+.sf-main[data-surface='plugin.ytmusic.player'] [data-role~='ytm-category-chip'] {
 	min-height: 26px;
 	padding: 3px 8px;
 	cursor: pointer;

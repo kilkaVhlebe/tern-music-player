@@ -25,6 +25,23 @@ local FOCUS_DELAY_MS = 250
 local FOCUS_ID = "main.search.field.query"
 local COVER_RESEND_MS = 1500
 local MAX_QUEUE_VIEW = 12
+type SearchCategory = player.SearchCategory
+type SearchItem = player.SearchItem
+local SEARCH_CATEGORIES: { { id: SearchCategory, label: string } } = {
+	{ id = "tracks", label = "Tracks" },
+	{ id = "artists", label = "Artists" },
+	{ id = "playlists", label = "Playlists" },
+	{ id = "podcasts", label = "Podcasts" },
+}
+
+local function category_label(category: SearchCategory): string
+	for _, entry in SEARCH_CATEGORIES do
+		if entry.id == category then
+			return entry.label
+		end
+	end
+	return "Tracks"
+end
 
 type Track = player.Track
 type Mode = "search" | "queue" | "playlist-name" | "artist-filter" | "library"
@@ -32,9 +49,11 @@ type DurationFilter = "all" | "short" | "medium" | "long"
 
 type State = {
 	mode: Mode,
+	category: SearchCategory,
+	detail_title: string,
 	query: string,
 	cursor: number,
-	results: { Track },
+	results: { SearchItem },
 	sel_search: number,
 	artist_filter: string,
 	artist_cursor: number,
@@ -59,6 +78,8 @@ type Block = {
 	search_at: number?,
 	focus_at: number?,
 	focus_id: string?,
+	origin_category: SearchCategory?,
+	origin_query: string?,
 	optimistic: { [string]: { value: any, expires: number } },
 }
 
@@ -258,24 +279,62 @@ local function enqueue_track(block: Block, track: Track): ()
 	say(block, "Queued " .. yt.cut(track.title, 60))
 end
 
-local function filtered_results(state: State): { Track }
+local function to_track(item: SearchItem): Track?
+	if item.kind ~= "track" or item.video == "" then
+		return nil
+	end
+	return {
+		url = item.url,
+		video = item.video,
+		title = item.title,
+		artist = item.artist,
+		duration = item.duration,
+	}
+end
+
+local function to_search_item(track: Track): SearchItem
+	return {
+		kind = "track",
+		title = track.title,
+		artist = track.artist,
+		detail = track.artist,
+		url = track.url,
+		video = track.video,
+		duration = track.duration,
+		browse_id = "",
+	}
+end
+
+local function filtered_results(state: State): { SearchItem }
+	local visible: { SearchItem } = {}
+	local use_filters = state.category == "tracks"
 	local needle = string.lower(string.match(state.artist_filter, "^%s*(.-)%s*$") or "")
-	local visible: { Track } = {}
-	for _, track in state.results do
-		local duration = track.duration
-		local duration_matches = if state.duration_filter == "short"
+	for _, item in state.results do
+		local duration = item.duration
+		local duration_matches = not use_filters or if state.duration_filter == "short"
 			then duration ~= nil and duration < 300
 			elseif state.duration_filter == "medium"
 			then duration ~= nil and duration >= 300 and duration < 1200
 			elseif state.duration_filter == "long"
 			then duration ~= nil and duration >= 1200
 			else true
-		local artist_matches = needle == "" or string.find(string.lower(track.artist), needle, 1, true) ~= nil
+		local artist_matches = not use_filters or needle == "" or string.find(string.lower(item.artist), needle, 1, true) ~= nil
 		if duration_matches and artist_matches then
-			table.insert(visible, track)
+			table.insert(visible, item)
 		end
 	end
 	return visible
+end
+
+local function filtered_tracks(state: State): { Track }
+	local tracks: { Track } = {}
+	for _, item in filtered_results(state) do
+		local track = to_track(item)
+		if track ~= nil then
+			table.insert(tracks, track)
+		end
+	end
+	return tracks
 end
 
 local function play_tracks(block: Block, tracks: { Track }, from: number, message: string): ()
@@ -311,7 +370,11 @@ local function save_playlist(block: Block, source: "results" | "queue"): ()
 	local name = string.match(block.state.playlist_name, "^%s*(.-)%s*$") or ""
 	local tracks: { Track } = {}
 	if source == "results" then
-		tracks = filtered_results(block.state)
+		tracks = filtered_tracks(block.state)
+		if #tracks == 0 then
+			say(block, "No tracks to save")
+			return
+		end
 	else
 		for _, row in queue do
 			table.insert(tracks, {
@@ -349,7 +412,7 @@ local function delete_playlist(block: Block): ()
 end
 
 local function play_all(block: Block, from: number): ()
-	local tracks = filtered_results(block.state)
+	local tracks = filtered_tracks(block.state)
 	play_tracks(block, tracks, from, string.format("Playing %d filtered tracks", #tracks))
 end
 
@@ -416,23 +479,111 @@ local function start_search(block: Block): ()
 		return
 	end
 	block.searching = true
+	block.state.results = {}
+	block.state.sel_search = 1
 	block.rendered = ""
-	player.search(query, function(tracks: { Track }, err: string?)
+	player.search(query, block.state.category, function(items: { SearchItem }, err: string?)
 		local live = blocks[block.context.pane]
 		if live ~= block or block.search_seq ~= seq then
 			return
 		end
 		block.searching = false
 		if err ~= nil then
-			say(block, "yt-dlp failed: " .. err)
+			say(block, "YouTube Music search failed: " .. yt.cut(err, 120))
 		else
-			block.state.results = tracks
+			block.state.results = items
 			block.state.sel_search = 1
 		end
 		block.rendered = ""
 		block.context:render()
 	end)
+end
+local function open_catalog_result(block: Block, item: SearchItem): ()
+	if item.kind == "track" then
+		local track = to_track(item)
+		if track ~= nil then
+			play_track(block, track)
+		end
+		return
+	end
+	local state = block.state
+	block.origin_category = state.category
+	block.origin_query = state.query
+	block.search_seq += 1
+	local seq = block.search_seq
+	block.search_at = nil
+	block.searching = true
+	state.category = "tracks"
+	state.detail_title = item.title
+	state.query = item.title
+	state.cursor = #state.query
+	state.results = {}
+	state.sel_search = 1
+	state.artist_filter = ""
+	state.artist_cursor = 0
+	state.duration_filter = "all"
+	state.mode = "search"
+	block.rendered = ""
+	player.open_search_result(item, function(tracks: { Track }, err: string?)
+		local live = blocks[block.context.pane]
+		if live ~= block or block.search_seq ~= seq then
+			return
+		end
+		block.searching = false
+		if err ~= nil then
+			say(block, "Could not open YouTube Music result: " .. yt.cut(err, 120))
+		else
+			for _, track in tracks do
+				table.insert(state.results, to_search_item(track))
+			end
+			if #state.results == 0 then
+				say(block, "No playable tracks found for " .. yt.cut(item.title, 60))
+			end
+		end
+		block.rendered = ""
+		block.context:render()
+	end)
+end
 
+local function back_to_results(block: Block): ()
+	local category = block.origin_category
+	if category == nil then
+		return
+	end
+	local state = block.state
+	block.origin_category = nil
+	state.detail_title = ""
+	state.category = category
+	state.query = block.origin_query or ""
+	state.cursor = #state.query
+	block.origin_query = nil
+	state.results = {}
+	state.sel_search = 1
+	block.searching = false
+	block.search_seq += 1
+	block.search_at = if state.query ~= "" then tern.now() + SEARCH_DEBOUNCE_MS else nil
+	block.rendered = ""
+end
+
+local function set_category(block: Block, category: SearchCategory): ()
+	local state = block.state
+	if state.category == category and state.detail_title == "" then
+		return
+	end
+	block.origin_category = nil
+	block.origin_query = nil
+	state.detail_title = ""
+	state.category = category
+	state.results = {}
+	state.sel_search = 1
+	state.artist_filter = ""
+	state.artist_cursor = 0
+	state.duration_filter = "all"
+	state.mode = "search"
+	block.search_seq += 1
+	block.searching = false
+	block.search_at = if state.query ~= "" then tern.now() + SEARCH_DEBOUNCE_MS else nil
+	block.rendered = ""
 end
 
 local function edit_text(text: string, cursor: number, k: Key): (string, number, boolean)
@@ -476,6 +627,9 @@ local function edit_query(block: Block, k: Key): boolean
 	end
 	state.cursor = cursor
 	if query ~= state.query then
+		block.origin_category = nil
+		block.origin_query = nil
+		state.detail_title = ""
 		block.search_seq += 1
 		block.searching = false
 		state.query = query
@@ -626,20 +780,21 @@ end
 local function search_section(block: Block, state: State): Node
 	local visible = filtered_results(state)
 	local items: { Item } = {}
-	for index, track in visible do
+	for index, result in visible do
 		items[index] = {
-			label = if track.title ~= "" then track.title else track.url,
-			detail = if track.artist ~= "" then track.artist else nil,
-			value = yt.clock(track.duration),
+			label = if result.title ~= "" then result.title else result.url,
+			detail = if result.detail ~= "" then result.detail else if result.artist ~= "" then result.artist else nil,
+			value = if result.duration == nil then nil else yt.clock(result.duration),
 		}
 	end
 	local list = ui.list(items)
 	local children: { Node } = list.c or {}
 	for index, child in children do
-		with(child, {
-			key = "r" .. tostring(index),
-			actions = { click = "play=" .. tostring(index), dblclick = "queue=" .. tostring(index) },
-		})
+		local result = visible[index]
+		local actions = if result ~= nil and result.kind == "track"
+			then { click = "play=" .. tostring(index), dblclick = "queue=" .. tostring(index) }
+			else { click = "open=" .. tostring(index) }
+		with(child, { key = "r" .. tostring(index), actions = actions })
 	end
 	local selected: string? = nil
 	if #visible > 0 then
@@ -652,56 +807,78 @@ local function search_section(block: Block, state: State): Node
 		empty = {
 			ui.span(
 				if block.searching
-					then "Searching YouTube…"
+					then "Searching YouTube Music…"
 					elseif #state.results > 0
 					then "No results match these filters"
-					else "Search for a track to get started",
+					else "Search YouTube Music for " .. string.lower(category_label(state.category)),
 				"muted"
 			),
 		},
 	}
 
-	local head: { Span } = { ui.span("Search", "strong") }
+	local head: { Span } = { ui.span(if state.detail_title ~= "" then state.detail_title else category_label(state.category), "strong") }
 	if block.searching then
 		table.insert(head, ui.span("  searching", "muted"))
 	end
 	if #state.results > 0 then
-		table.insert(head, ui.span(string.format("  %d of %d tracks", #visible, #state.results), "muted"))
+		table.insert(head, ui.span(string.format("  %d of %d", #visible, #state.results), "muted"))
 	end
+
+	local categories: { Node } = {}
+	for _, entry in SEARCH_CATEGORIES do
+		table.insert(
+			categories,
+			clickable(
+				ui.badge(entry.label, if state.category == entry.id then "accent" else "muted"),
+				"category=" .. entry.id,
+				"ytm-category-chip"
+			)
+		)
+	end
+	if block.origin_category ~= nil then
+		table.insert(categories, clickable(ui.badge("Back to results", "muted"), "back-results", "ytm-category-chip"))
+	end
+	local category_row = with(ui.row(categories), { key = "categories", role = "ytm-search-categories ytm-filter-row" })
 
 	local query_input = with(ui.node("input", {
 		key = "query",
 		text = state.query,
 		cursor = yt.units_for_bytes(state.query, state.cursor),
-		placeholder = "Search YouTube…",
+		placeholder = "Search YouTube Music…",
 	}), { grow = 1 })
-	local search_buttons = with(ui.row({
-		clickable(ui.badge("Add selected", "muted"), "enqueue-selected"),
-		clickable(ui.badge("Play all", "accent"), "play-all"),
-	}), { key = "buttons", role = "ytm-search-buttons" })
-
-	local duration_filter = state.duration_filter
-	local function duration_chip(id: DurationFilter, label: string): Node
-		return clickable(ui.badge(label, if duration_filter == id then "accent" else "muted"), "duration=" .. id, "ytm-filter-chip")
+	local search_buttons: { Node } = {}
+	if state.category == "tracks" then
+		table.insert(search_buttons, clickable(ui.badge("Add selected", "muted"), "enqueue-selected"))
+		table.insert(search_buttons, clickable(ui.badge("Play all", "accent"), "play-all"))
+	else
+		table.insert(search_buttons, clickable(ui.badge("Open selected", "accent"), "open-selected"))
 	end
-	local channel_input = with(ui.node("input", {
-		key = "artist",
-		text = state.artist_filter,
-		cursor = yt.units_for_bytes(state.artist_filter, state.artist_cursor),
-		placeholder = "Filter by artist or channel",
-	}), { grow = 1 })
-
-	return with(ui.section(head, {
-		with(ui.row({ query_input, search_buttons }), { key = "field", role = "ytm-search-field" }),
-		with(ui.row({
+	local field = with(ui.row({ query_input, with(ui.row(search_buttons), { key = "buttons", role = "ytm-search-buttons" }) }), {
+		key = "field",
+		role = "ytm-search-field",
+	})
+	local body: { Node } = { category_row, field }
+	if state.category == "tracks" then
+		local duration_filter = state.duration_filter
+		local function duration_chip(id: DurationFilter, label: string): Node
+			return clickable(ui.badge(label, if duration_filter == id then "accent" else "muted"), "duration=" .. id, "ytm-filter-chip")
+		end
+		local channel_input = with(ui.node("input", {
+			key = "artist",
+			text = state.artist_filter,
+			cursor = yt.units_for_bytes(state.artist_filter, state.artist_cursor),
+			placeholder = "Filter by artist",
+		}), { grow = 1 })
+		table.insert(body, with(ui.row({
 			duration_chip("all", "Any length"),
 			duration_chip("short", "Under 5 min"),
 			duration_chip("medium", "5–20 min"),
 			duration_chip("long", "20+ min"),
-		}), { key = "duration-filters", role = "ytm-filter-row" }),
-		with(ui.row({ channel_input }), { key = "filters", role = "ytm-channel-filter" }),
-		list,
-	}), { key = "search", role = "ytm-search", collapsible = true })
+		}), { key = "duration-filters", role = "ytm-filter-row" }))
+		table.insert(body, with(ui.row({ channel_input }), { key = "filters", role = "ytm-channel-filter" }))
+	end
+	table.insert(body, list)
+	return with(ui.section(head, body), { key = "search", role = "ytm-search", collapsible = true })
 end
 
 local function queue_section(state: State, p: yt.Player?): Node
@@ -772,8 +949,11 @@ local function playlists_section(state: State): Node
 		cursor = yt.units_for_bytes(state.playlist_name, state.playlist_cursor),
 		placeholder = "Playlist name",
 	}), { grow = 1 })
+	local save_result_button = if state.category == "tracks"
+		then clickable(ui.badge("Save results", "muted"), "save-results")
+		else ui.badge("Save results", "muted")
 	local save_buttons = with(ui.row({
-		clickable(ui.badge("Save results", "muted"), "save-results"),
+		save_result_button,
 		clickable(ui.badge("Save queue", "muted"), "save-queue"),
 	}), { key = "save-buttons", role = "ytm-playlist-save" })
 	local playlist_buttons = with(ui.row({
@@ -824,7 +1004,7 @@ local function hints(state: State, cx: BlockCx): Node
 	if state.mode == "search" then
 		key("type", "search")
 		key("↑↓", "pick results")
-		key("enter", "play")
+		key("enter", if state.category == "tracks" then "play" else "open")
 		key("tab", "queue")
 	elseif state.mode == "artist-filter" then
 		key("type", "filter artist")
@@ -910,6 +1090,8 @@ local function signature(block: Block): string
 		tostring(#queue),
 		block.state.mode,
 		block.state.query,
+		block.state.category,
+		block.state.detail_title,
 		tostring(block.state.cursor),
 		tostring(#block.state.results),
 		tostring(block.state.sel_search),
@@ -1055,19 +1237,23 @@ local function key_search(block: Block, k: Key): boolean?
 	elseif k.name == "down" then
 		state.sel_search = math.min(math.max(#visible, 1), state.sel_search + 1)
 	elseif k.name == "enter" then
-		local track = visible[math.clamp(state.sel_search, 1, math.max(#visible, 1))]
-		if track ~= nil then
-			play_track(block, track)
+		local result = visible[math.clamp(state.sel_search, 1, math.max(#visible, 1))]
+		if result ~= nil then
+			open_catalog_result(block, result)
 		end
 	elseif k.name == "escape" then
-		if state.query ~= "" then
+		if block.origin_category ~= nil then
+			back_to_results(block)
+		elseif state.query ~= "" then
 			block.search_seq += 1
 			block.searching = false
 			state.query = ""
 			state.cursor = 0
-			block.search_at = tern.now() + SEARCH_DEBOUNCE_MS
+			state.results = {}
+			block.search_at = nil
+		else
+			state.mode = "queue"
 		end
-		state.mode = "queue"
 	else
 		return edit_query(block, k)
 	end
@@ -1138,11 +1324,23 @@ local function selected_track(state: State): Track?
 	if #visible == 0 then
 		return nil
 	end
-	return visible[math.clamp(state.sel_search, 1, #visible)]
+	return to_track(visible[math.clamp(state.sel_search, 1, #visible)])
 end
 
 local function on_action(block: Block, state: State, act: string, raw: string?): ()
-	if act == "play-pause" then
+	if act == "category" and raw ~= nil then
+		if raw == "tracks" or raw == "artists" or raw == "playlists" or raw == "podcasts" then
+			set_category(block, raw :: SearchCategory)
+		end
+	elseif act == "open-selected" then
+		local visible = filtered_results(state)
+		local result = visible[math.clamp(state.sel_search, 1, math.max(#visible, 1))]
+		if result ~= nil then
+			open_catalog_result(block, result)
+		end
+	elseif act == "back-results" then
+		back_to_results(block)
+	elseif act == "play-pause" then
 		toggle_play(block)
 	elseif act == "next" then
 		next_track(block)
@@ -1166,7 +1364,7 @@ local function on_action(block: Block, state: State, act: string, raw: string?):
 		local enabled = not player.autoplay()
 		local ok, failure = player.set_autoplay(enabled)
 		say(block, if ok then (if enabled then "Similar-track autoplay enabled" else "Autoplay disabled") else "Could not update autoplay: " .. (failure or "unknown error"))
-	elseif act == "duration" and raw ~= nil and (raw == "all" or raw == "short" or raw == "medium" or raw == "long") then
+	elseif act == "duration" and raw ~= nil and state.category == "tracks" and (raw == "all" or raw == "short" or raw == "medium" or raw == "long") then
 		state.duration_filter = raw :: DurationFilter
 		state.sel_search = 1
 	elseif act == "play-all" then
@@ -1186,13 +1384,20 @@ local function on_action(block: Block, state: State, act: string, raw: string?):
 		enqueue_selected_playlist(block)
 	elseif act == "delete-playlist" then
 		delete_playlist(block)
+	elseif raw ~= nil and act == "open" then
+		local result = filtered_results(state)[tonumber(raw) or 0]
+		if result ~= nil then
+			open_catalog_result(block, result)
+		end
 	elseif raw ~= nil and act == "play" then
-		local track = filtered_results(state)[tonumber(raw) or 0]
+		local item = filtered_results(state)[tonumber(raw) or 0]
+		local track = if item == nil then nil else to_track(item)
 		if track ~= nil then
 			play_track(block, track)
 		end
 	elseif raw ~= nil and act == "queue" then
-		local track = filtered_results(state)[tonumber(raw) or 0]
+		local item = filtered_results(state)[tonumber(raw) or 0]
+		local track = if item == nil then nil else to_track(item)
 		if track ~= nil then
 			enqueue_track(block, track)
 		end
@@ -1209,6 +1414,8 @@ local player_block: BlockDef<State> = {
 		local restored: any = saved
 		local state: State = {
 			mode = "search",
+			category = "tracks",
+			detail_title = "",
 			query = "",
 			cursor = 0,
 			results = {},
@@ -1224,6 +1431,13 @@ local player_block: BlockDef<State> = {
 			flash_until = 0,
 		}
 		if type(restored) == "table" then
+			if restored.category == "tracks"
+				or restored.category == "artists"
+				or restored.category == "playlists"
+				or restored.category == "podcasts"
+			then
+				state.category = restored.category
+			end
 			if type(restored.query) == "string" then
 				state.query = restored.query
 				state.cursor = #state.query
@@ -1275,6 +1489,8 @@ local player_block: BlockDef<State> = {
 			focus_at = if focus_id == nil then nil else tern.now() + FOCUS_DELAY_MS,
 			focus_id = focus_id,
 			optimistic = {},
+			origin_category = nil,
+			origin_query = nil,
 		}
 		blocks[cx.pane] = block
 		start_loop()
@@ -1405,6 +1621,7 @@ local player_block: BlockDef<State> = {
 		return {
 			query = state.query,
 			mode = state.mode,
+			category = state.category,
 			artist_filter = state.artist_filter,
 			duration_filter = state.duration_filter,
 			playlist_name = state.playlist_name,
