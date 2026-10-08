@@ -17,7 +17,7 @@ export type Item = {
 }
 
 local API = "https://music.youtube.com/youtubei/v1/"
-local API_KEY = "AIzaSyC9XL3ZjWddXya6X74dJoCTL-WEYFDNX30"
+local SECRETS_FILE = ".secrets.json"
 local USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:88.0) Gecko/20100101 Firefox/88.0"
 local LIMIT = 40
 
@@ -184,7 +184,7 @@ end
 
 local function decode_response(response: any, done: (document: any?, err: string?) -> ()): ()
 	if response.error ~= nil then
-		done(nil, tostring(response.error))
+		done(nil, "YouTube Music request failed")
 		return
 	end
 	if response.status < 200 or response.status >= 300 then
@@ -199,7 +199,29 @@ local function decode_response(response: any, done: (document: any?, err: string
 	done(document, nil)
 end
 
+local function read_api_key(): (string?, string?)
+	local ok, content = pcall(tern.fs.read, SECRETS_FILE, 4096)
+	if not ok or type(content) ~= "string" then
+		return nil, "Missing .secrets.json with youtube_music_api_key"
+	end
+	local decoded, secrets = pcall(tern.json.decode, content)
+	if not decoded or type(secrets) ~= "table" then
+		return nil, "Invalid .secrets.json; expected youtube_music_api_key"
+	end
+	local key = field(secrets, "youtube_music_api_key")
+	if type(key) ~= "string" or string.match(key, "^AIza[%w_-]+$") == nil then
+		return nil, "Invalid youtube_music_api_key in .secrets.json"
+	end
+	return key, nil
+end
+
 local function post(endpoint: string, body: { [string]: any }, done: (document: any?, err: string?) -> ()): ()
+	local api_key, key_error = read_api_key()
+	if api_key == nil then
+		done(nil, key_error)
+		return
+	end
+
 	body.context = {
 		client = {
 			clientName = "WEB_REMIX",
@@ -213,8 +235,8 @@ local function post(endpoint: string, body: { [string]: any }, done: (document: 
 		done(nil, "Could not encode YouTube Music request")
 		return
 	end
-	local url = API .. endpoint .. "?alt=json&key=" .. API_KEY
-	local started, failure = pcall(function()
+	local url = API .. endpoint .. "?alt=json&key=" .. api_key
+	local started = pcall(function()
 		tern.fetch(url, {
 			method = "POST",
 			headers = {
@@ -229,7 +251,7 @@ local function post(endpoint: string, body: { [string]: any }, done: (document: 
 		end)
 	end)
 	if not started then
-		done(nil, tostring(failure))
+		done(nil, "Could not start YouTube Music request")
 	end
 end
 

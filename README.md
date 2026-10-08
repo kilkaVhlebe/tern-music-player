@@ -100,6 +100,12 @@ YouTube text search. Toggle it from the **autoplay on/off** chip.
 The public YouTube Music search/recommendation API is undocumented and can
 change; the implementation follows the community-maintained
 [ytmusicapi search reference](https://ytmusicapi.readthedocs.io/en/stable/reference/search.html).
+The catalog key is loaded from the repository-root `.secrets.json`, which Git
+ignores. It must contain `youtube_music_api_key`; the plugin fails closed if
+the file or value is missing. The existing `WEB_REMIX` key is a shared public
+YouTube Music client key, not a project-specific credential; moving one to a
+local file does not make a public key private or let this plugin revoke it.
+
 
 Every control is also clickable; the icon rows need no focus. The playlist
 name, artist filter and search query each accept typing and paste.
