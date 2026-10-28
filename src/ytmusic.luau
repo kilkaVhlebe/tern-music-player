@@ -46,6 +46,11 @@ export type Player = {
 	index: number,
 	count: number,
 	seq: number,
+	-- The queue file's version: queue.txt needs reading only when it changed.
+	qv: number,
+	-- The bridge's command protocol (0 for bridges from before it was
+	-- reported): 2 takes the batch commands and the command end marker.
+	proto: number,
 	title: string,
 	artist: string,
 	video: string,
@@ -125,7 +130,33 @@ local function loop_of(raw: string?): Loop
 	return "off"
 end
 
-local function parse_state(text: string): Player?
+-- Replaces bytes that are not valid UTF-8 with U+FFFD: text from mpv
+-- metadata and remote catalogs reaches the view, which wants valid UTF-8.
+function ytmusic.valid_utf8(text: string): string
+	if utf8.len(text) ~= nil then
+		return text
+	end
+	local parts: { string } = {}
+	local position = 1
+	while position <= #text do
+		local ok, bad = utf8.len(text, position)
+		if ok ~= nil then
+			table.insert(parts, string.sub(text, position))
+			break
+		end
+		local stop = bad :: number
+		if stop > position then
+			table.insert(parts, string.sub(text, position, stop - 1))
+		end
+		table.insert(parts, "\u{FFFD}")
+		position = stop + 1
+	end
+	return table.concat(parts)
+end
+
+-- Parses state.txt. The second result is true when the file was caught
+-- mid-write (the bridge writes `ok=1` last): the caller keeps what it had.
+local function parse_state(text: string): (Player?, boolean)
 	local fields: { [string]: string } = {}
 	for line in string.gmatch(text, "[^\n]+") do
 		local key, value = string.match(line, "^([%w_]+)=(.*)$")
@@ -134,7 +165,14 @@ local function parse_state(text: string): Player?
 		end
 	end
 	if fields.v ~= "1" then
-		return nil
+		return nil, text == ""
+	end
+	-- A current bridge ends the file with `ok=1`. One from before that (still
+	-- running after an upgrade) writes no `qv` and ends with `err=`; anything
+	-- else is a read that caught a write halfway.
+	local complete = fields.ok == "1" or (fields.qv == nil and fields.err ~= nil)
+	if not complete then
+		return nil, true
 	end
 	return {
 		beat = number_of(fields, "beat") or 0,
@@ -149,23 +187,26 @@ local function parse_state(text: string): Player?
 		index = number_of(fields, "index") or -1,
 		count = number_of(fields, "count") or 0,
 		seq = number_of(fields, "seq") or 0,
-		title = fields.title or "",
-		artist = fields.artist or "",
+		qv = number_of(fields, "qv") or -1,
+		proto = number_of(fields, "proto") or 0,
+		title = ytmusic.valid_utf8(fields.title or ""),
+		artist = ytmusic.valid_utf8(fields.artist or ""),
 		video = fields.video or "",
 		url = fields.url or "",
 		failed = number_of(fields, "failed"),
 		fail_seq = number_of(fields, "fail_seq") or 0,
-		err = fields.err or "",
-	}
+		err = ytmusic.valid_utf8(fields.err or ""),
+	}, false
 end
 
--- The last good state, or nil when no player wrote one (or the file is unreadable).
--- The file is a few hundred bytes; the bound keeps the read cheap on the window's
--- UI thread, where every call has a 50 ms budget.
-function ytmusic.read(): Player?
+-- The last good state, or nil when no player wrote one (or the file is
+-- unreadable). The second result is true for a read that raced a write.
+-- The file is a few hundred bytes; the bound keeps the read cheap on the
+-- window's UI thread, where every call has a 50 ms budget.
+function ytmusic.read(): (Player?, boolean)
 	local ok, text = pcall(tern.fs.read, STATE, 8 * 1024)
 	if not ok then
-		return nil
+		return nil, false
 	end
 	return parse_state(text)
 end
@@ -174,12 +215,15 @@ function ytmusic.fresh(player: Player?): boolean
 	return player ~= nil and os.time() - player.beat <= STALE_S
 end
 
-function ytmusic.queue(): { Flat }
-	local ok, text = pcall(tern.fs.read, QUEUE, 256 * 1024)
+-- Reads queue.txt. Returns the rows and the version its last line carries
+-- (-1 for a file without one: an old bridge, or a write still in progress).
+function ytmusic.queue(): ({ Flat }, number)
+	local ok, text = pcall(tern.fs.read, QUEUE, 1024 * 1024)
 	if not ok then
-		return {}
+		return {}, -1
 	end
 	local rows: { Flat } = {}
+	local version = -1
 	for line in string.gmatch(text, "[^\n]+") do
 		local index, url, video, title, artist = string.match(line, "^(%-?%d+)\t(.*)\t(.*)\t(.*)\t(.*)$")
 		if index ~= nil and url ~= nil and video ~= nil and title ~= nil and artist ~= nil then
@@ -187,12 +231,17 @@ function ytmusic.queue(): { Flat }
 				index = tonumber(index) or 0,
 				url = url,
 				video = video,
-				title = title,
-				artist = artist,
+				title = ytmusic.valid_utf8(title),
+				artist = ytmusic.valid_utf8(artist),
 			})
+		else
+			local stamp = string.match(line, "^#qv\t(%d+)")
+			if stamp ~= nil then
+				version = tonumber(stamp) or -1
+			end
 		end
 	end
-	return rows
+	return rows, version
 end
 
 local cmd_seq = 0
@@ -205,21 +254,32 @@ local function one_line(text: string): string
 	return (string.gsub(clean, "^%s*(.-)%s*$", "%1"))
 end
 
+-- The sort key of the last command file: strictly increasing within this
+-- VM and close to wall-clock milliseconds, so files from one handler run in
+-- the order they were sent and files from two VMs interleave by time.
+local last_stamp = 0
+
 -- Queues one command for the bridge and returns whether it was written.
--- The name sorts by time within this VM, so commands from one handler arrive
--- in the order they were sent; the token keeps two VMs' files apart.
+-- The token keeps two VMs' files apart.
 function ytmusic.send(name: string, ...: string): boolean
 	cmd_seq += 1
-	local stamp = string.format("%013d", os.time() * 1000 + math.floor(tern.now() % 1000))
-	local file = string.format("%s-%04d-%s.cmd", stamp, cmd_seq % 10000, cmd_token)
+	last_stamp = math.max(last_stamp + 1, os.time() * 1000)
+	local file = string.format("%013d-%04d-%s.cmd", last_stamp, cmd_seq % 10000, cmd_token)
 	local lines: { string } = { name }
 	for _, arg in { ... } do
 		table.insert(lines, one_line(arg))
 	end
-	local ok = pcall(function()
-		tern.fs.mkdir(CMDS)
-		tern.fs.write(CMDS .. SEP .. file, table.concat(lines, "\n") .. "\n")
-	end)
+	local path = CMDS .. SEP .. file
+	-- The "." line marks the file complete for the bridge (see bridge.lua).
+	local body = table.concat(lines, "\n") .. "\n.\n"
+	local ok = pcall(tern.fs.write, path, body)
+	if not ok then
+		-- The directory went away (a fresh data dir, a wipe): make it, retry.
+		ok = pcall(function()
+			tern.fs.mkdir(CMDS)
+			tern.fs.write(path, body)
+		end)
+	end
 	if not ok then
 		tern.log.warn("ytmusic: could not write the command", name)
 	end
@@ -240,11 +300,23 @@ function ytmusic.clock(seconds: number?): string
 	return string.format("%d:%02d", minutes, secs)
 end
 
+-- At most `limit` characters of `text`, with an ellipsis when it was longer.
+-- Counts code points, not bytes, so a cut never splits a UTF-8 sequence and
+-- Cyrillic or CJK titles get the same room as Latin ones.
 function ytmusic.cut(text: string, limit: number): string
 	if #text <= limit then
 		return text
 	end
-	return string.sub(text, 1, math.max(1, limit - 1)) .. "…"
+	local count = utf8.len(text)
+	if count == nil then
+		text = ytmusic.valid_utf8(text)
+		count = utf8.len(text) or #text
+	end
+	if (count :: number) <= limit then
+		return text
+	end
+	local stop = utf8.offset(text, math.max(2, limit)) or (#text + 1)
+	return string.sub(text, 1, stop - 1) .. "…"
 end
 
 function ytmusic.thumb(video: string): string
@@ -629,6 +701,9 @@ function ytmusic.mpv_argv(): { string }
 		"--no-terminal",
 		"--ytdl=yes",
 		"--ytdl-format=bestaudio/best",
+		-- Resolve and buffer the next entry while the current one ends, so
+		-- the gap between tracks is not a full yt-dlp lookup.
+		"--prefetch-playlist=yes",
 		"--volume=" .. tostring(stored_volume()),
 		"--script=" .. bridge_path(),
 		"--log-file=" .. LOG,

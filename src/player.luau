@@ -11,6 +11,7 @@ local process = require("./process")
 local yt = require("./ytmusic")
 local catalog = require("./catalog")
 local soundcloud = require("./soundcloud")
+local net = require("./net")
 
 local TOOL_TIMEOUT_MS = 5000
 local SPAWN_COOLDOWN_MS = 3000
@@ -29,6 +30,11 @@ local RECS_LIMIT = 12
 local RECS_ARTIST_CAP = 2
 -- Radio-playlist probes for the first N seeds; each costs two requests.
 local RECS_PLAYLIST_PROBES = 2
+-- The row rebuilds itself when the history moved by this many tracks, or
+-- when it is this old and the history changed at all, so most heard tracks
+-- cost no requests (a full rebuild is about a dozen).
+local RECS_HISTORY_DELTA = 3
+local RECS_MAX_AGE_MS = 10 * 60 * 1000
 local MERGE_TOLERANCE_S = 5
 local RELATED_TOLERANCE_S = 20
 local FALLBACK_ATTEMPT_LIMIT = 2
@@ -40,7 +46,11 @@ local HISTORY_LIMIT = 20
 -- A track counts as heard after this much accumulated playing time; short
 -- skips and false starts never reach the history or shape the recommendations.
 local HISTORY_PLAY_SECONDS = 10
-local ART_MAX = 24
+local ART_MAX = 48
+-- A cover that failed to load is retried after this long, not every poll and
+-- not never (a network blip must not leave a track without art for good).
+local ART_RETRY_MS = 10 * 60 * 1000
+local COVER_TIMEOUT_MS = 10000
 
 export type Track = {
 	url: string,
@@ -64,13 +74,19 @@ local player = {}
 local current: yt.Player? = nil
 local changed: (() -> ())? = nil
 local queue: { yt.Flat } = {}
+-- The queue.txt version `queue` was read at; -1 forces the next read.
+local queue_version = -1
+-- Rises whenever `queue` is replaced, so views can tell it changed cheaply.
+local queue_epoch = 0
 local running = false
 local spawned_at = -math.huge
 local tool_problem: string? = nil
 local tools_checked = false
 local pending: { Pending } = {}
 local art: { key: string?, bytes: string?, mime: string? } = {}
-local art_cache: { [string]: { bytes: string, mime: string } } = {}
+-- Fetched covers by track url. An entry with empty bytes is a failure,
+-- retried once `at` is ART_RETRY_MS old; both kinds count against ART_MAX.
+local art_cache: { [string]: { bytes: string, mime: string, at: number } } = {}
 local art_order: { string } = {}
 -- Covers currently being fetched, so the same url is never requested twice
 -- and concurrent fetches (hero + recommendation cards) do not clash.
@@ -82,6 +98,7 @@ local autoplay_message = ""
 local autoplay_generation = 0
 local autoplay_seed: string? = nil
 local autoplay_searching = false
+local autoplay_started = 0
 local autoplay_seen: { [string]: boolean } = {}
 local autoplay_seen_order: { string } = {}
 local spawned_pid: number? = nil
@@ -92,7 +109,7 @@ local spawn_generation = 0
 -- needs no extra round trip; keyed by the track URL.
 local art_hints: { [string]: string } = {}
 local art_hint_order: { string } = {}
-local ART_HINT_LIMIT = 64
+local ART_HINT_LIMIT = 256
 
 -- The failed-entry replacement: generation invalidates an in-flight search
 -- when another failure takes over, `last_seq` (a counter the bridge raises
@@ -244,7 +261,9 @@ function player.set_autoplay(enabled: boolean): (boolean, string?)
 	if preferences_error ~= nil then
 		return false, preferences_error
 	end
-	local ok, failure = pcall(tern.kv.set, AUTOPLAY_KEY, enabled)
+	local ok, failure = pcall(function()
+		tern.kv.set(AUTOPLAY_KEY, enabled)
+	end)
 	if not ok then
 		return false, tostring(failure)
 	end
@@ -323,7 +342,9 @@ function player.save_playlist(name: string, tracks: { Track }): (boolean, string
 		end
 		table.insert(next_playlists, replacement)
 	end
-	local ok, failure = pcall(tern.kv.set, PLAYLISTS_KEY, next_playlists)
+	local ok, failure = pcall(function()
+		tern.kv.set(PLAYLISTS_KEY, next_playlists)
+	end)
 	if not ok then
 		return false, tostring(failure)
 	end
@@ -346,7 +367,9 @@ function player.delete_playlist(index: number): (boolean, string?)
 			table.insert(next_playlists, playlist)
 		end
 	end
-	local ok, failure = pcall(tern.kv.set, PLAYLISTS_KEY, next_playlists)
+	local ok, failure = pcall(function()
+		tern.kv.set(PLAYLISTS_KEY, next_playlists)
+	end)
 	if not ok then
 		return false, tostring(failure)
 	end
@@ -382,6 +405,59 @@ end
 
 function player.queue(): { yt.Flat }
 	return queue
+end
+
+-- Rises whenever the queue rows change.
+function player.queue_epoch(): number
+	return queue_epoch
+end
+
+local function set_queue(rows: { yt.Flat }, version: number): ()
+	queue = rows
+	queue_version = version
+	queue_epoch += 1
+end
+
+-- Why the last player exited, once: the block shows it as a notice. A crash
+-- is not a missing tool, so it never blocks the next start.
+local exit_note: string? = nil
+
+function player.take_exit_note(): string?
+	local note = exit_note
+	exit_note = nil
+	return note
+end
+
+-- Consecutive reads that caught state.txt mid-write. The bridge rewrites it
+-- in far less than a poll, so a file that stays half-written is a leftover
+-- from a player that died while writing: after TORN_LIMIT reads it counts
+-- as no state at all, and a new player may start.
+local TORN_LIMIT = 6
+local torn_streak = 0
+
+local function read_state(): (yt.Player?, boolean)
+	local latest, torn = yt.read()
+	if not torn then
+		torn_streak = 0
+		return latest, false
+	end
+	torn_streak += 1
+	if torn_streak >= TORN_LIMIT then
+		return nil, false
+	end
+	return nil, true
+end
+
+-- state.txt, retried a few times when a read races the bridge's write.
+local function read_settled(): (yt.Player?, boolean)
+	local latest, torn = read_state()
+	for _ = 1, 2 do
+		if not torn then
+			break
+		end
+		latest, torn = read_state()
+	end
+	return latest, torn
 end
 
 function player.art(): { key: string?, bytes: string?, mime: string? }
@@ -454,17 +530,14 @@ local function spawn(): ()
 			if generation ~= spawn_generation then
 				return
 			end
-			local last = yt.read()
+			local last = read_settled()
 			exited_pid = spawned_pid or if last == nil then nil else last.pid
 			spawned_pid = nil
 			running = false
 			current = nil
-			queue = {}
+			set_queue({}, -1)
 			if result.status ~= 0 then
-				tool_problem = string.format(
-					"mpv exited with status %d; see mpv.log in the plugin's data directory",
-					result.status
-				)
+				exit_note = string.format("mpv stopped unexpectedly (status %d); see mpv.log", result.status)
 			end
 			notify()
 		end)
@@ -490,8 +563,13 @@ function player.ensure(): ()
 	-- Consult the file, not the in-memory state: after a plugin reload the
 	-- memory is empty while the player keeps running, and spawning here would
 	-- leave two players writing the same files.
-	local latest = yt.read()
-	if yt.fresh(latest) and (exited_pid == nil or latest.pid ~= exited_pid) then
+	local latest, torn = read_settled()
+	if torn then
+		-- The file is mid-write: a player is writing it. Starting another
+		-- would make the bridges fight over it; try on the next poll.
+		return
+	end
+	if latest ~= nil and yt.fresh(latest) and (exited_pid == nil or latest.pid ~= exited_pid) then
 		if exited_pid ~= nil then
 			exited_pid = nil
 		end
@@ -504,27 +582,91 @@ function player.ensure(): ()
 	spawn()
 end
 
+-- The pid of a pre-upgrade player asked to quit, and whether to start the
+-- current one once it is gone.
+local upgrade_quit_pid: number? = nil
+local upgrade_restart = false
+
 -- Sends a command now, or remembers it for the moment a fresh player appears.
 local function request(name: string, invalidate: boolean, ...: string): ()
 	if invalidate then
 		invalidate_autoplay()
 	end
-	if yt.fresh(current) then
+	-- A player being retired for an upgrade would run a command and quit:
+	-- hold commands for the one that replaces it.
+	local state = current
+	if yt.fresh(state) and not (state ~= nil and state.pid == upgrade_quit_pid) then
 		yt.send(name, ...)
 		return
 	end
 	local args: { string } = { ... }
 	table.insert(pending, { name = name, args = args })
+	-- A player that never comes up must not grow this without bound.
+	while #pending > 400 do
+		table.remove(pending, 1)
+	end
 	player.ensure()
 end
 
 function player.request(name: string, ...: string): ()
 	request(
 		name,
-		name == "play" or name == "clear" or name == "jump" or name == "remove"
-			or name == "enqueue" or name == "next" or name == "prev",
+		name == "play" or name == "clear" or name == "jump" or name == "remove" or name == "setqueue"
+			or name == "enqueue" or name == "enqueuemany" or name == "playnext" or name == "next" or name == "prev",
 		...
 	)
+end
+
+-- A bridge speaking protocol 2 takes the batch commands; one from before
+-- that (still running after an upgrade) gets them one by one.
+local function batch_capable(): boolean
+	local state = current
+	return state == nil or state.proto >= 2
+end
+
+local function track_args(tracks: { Track }, into: { string }): { string }
+	for _, track in tracks do
+		table.insert(into, track.url)
+		table.insert(into, track.video)
+		table.insert(into, track.title)
+		table.insert(into, track.artist)
+	end
+	return into
+end
+
+-- Replaces the queue with `tracks` and plays the one at 1-based `start`.
+function player.set_queue(tracks: { Track }, start: number): ()
+	if #tracks == 0 then
+		return
+	end
+	if batch_capable() then
+		player.request("setqueue", table.unpack(track_args(tracks, { tostring(start - 1) })))
+		return
+	end
+	player.request("clear")
+	for _, track in tracks do
+		player.request("enqueue", track.url, track.video, track.title, track.artist)
+	end
+	player.request("jump", tostring(start - 1))
+end
+
+-- Appends `tracks` to the queue.
+function player.enqueue_many(tracks: { Track }): ()
+	if #tracks == 0 then
+		return
+	end
+	if batch_capable() then
+		player.request("enqueuemany", table.unpack(track_args(tracks, {})))
+		return
+	end
+	for _, track in tracks do
+		player.request("enqueue", track.url, track.video, track.title, track.artist)
+	end
+end
+
+-- Puts `track` right after the current one.
+function player.play_next(track: Track): ()
+	player.request(if batch_capable() then "playnext" else "enqueue", track.url, track.video, track.title, track.artist)
 end
 
 -- Watches the playing track and, once it has played HISTORY_PLAY_SECONDS,
@@ -577,9 +719,19 @@ local function tick_history(): ()
 end
 
 -- Reads the files the bridge wrote. Returns the fresh state, if any.
-function player.poll(): yt.Player?
-	local latest = yt.read()
-	if yt.fresh(latest) and (exited_pid == nil or latest.pid ~= exited_pid) then
+-- `shown` is whether a block is open: a player retired for an upgrade is
+-- restarted only for someone looking at it.
+function player.poll(shown: boolean): yt.Player?
+	local latest, torn = read_state()
+	if torn then
+		-- The bridge was mid-write: keep the last state while it is fresh
+		-- and act on the next read instead.
+		if current ~= nil and not yt.fresh(current) then
+			current = nil
+		end
+		return current
+	end
+	if latest ~= nil and yt.fresh(latest) and (exited_pid == nil or latest.pid ~= exited_pid) then
 		if exited_pid ~= nil then
 			exited_pid = nil
 		end
@@ -587,16 +739,58 @@ function player.poll(): yt.Player?
 		if running then
 			spawned_pid = latest.pid
 		end
-		flush_pending()
-		sync_hold(current)
+		local retiring = latest.pid == upgrade_quit_pid
+		if not retiring and #pending == 0 and latest.proto < 2 and latest.count == 0 and latest.state == "idle" then
+			-- A player started before this version of the bridge, idle with
+			-- nothing queued: restart it so it runs the current bridge.
+			upgrade_quit_pid = latest.pid
+			upgrade_restart = true
+			retiring = true
+			yt.send("quit")
+		end
+		if not retiring then
+			flush_pending()
+			sync_hold(current)
+		end
 	else
 		current = nil
-		if #pending > 0 then
-			-- A command is waiting with no player to run it: start one.
+		if #pending > 0 or (upgrade_restart and shown) then
+			-- A command is waiting with no player to run it, or the old
+			-- player was retired for an upgrade: start one.
+			upgrade_restart = false
 			player.ensure()
 		end
 	end
-	queue = if current == nil then {} else yt.queue()
+	local now_state = current
+	if now_state == nil then
+		if queue_version ~= -1 or #queue > 0 then
+			set_queue({}, -1)
+		end
+	elseif now_state.qv < 0 then
+		-- A bridge from before queue versions: read the queue every poll,
+		-- but only count it as changed when its rows did.
+		local rows = yt.queue()
+		local same = #rows == #queue
+		if same then
+			for index, row in rows do
+				local known = queue[index]
+				if row.url ~= known.url or row.title ~= known.title or row.artist ~= known.artist then
+					same = false
+					break
+				end
+			end
+		end
+		if not same then
+			set_queue(rows, -1)
+		end
+	elseif now_state.qv ~= queue_version then
+		local rows, version = yt.queue()
+		-- A queue file that does not match state.txt is being rewritten;
+		-- the next poll picks up the finished one.
+		if version == now_state.qv then
+			set_queue(rows, version)
+		end
+	end
 	tick_history()
 	if tick_recs ~= nil then
 		tick_recs()
@@ -614,16 +808,6 @@ end
 
 -- YouTube Music catalog -------------------------------------------------
 
-local function to_track(item: SearchItem): Track
-	return {
-		url = item.url,
-		video = item.video,
-		title = item.title,
-		artist = item.artist,
-		duration = item.duration,
-	}
-end
-
 local function remember_art(url: string, art_url: string): ()
 	if url == "" or art_url == "" or art_hints[url] ~= nil then
 		return
@@ -636,6 +820,21 @@ local function remember_art(url: string, art_url: string): ()
 			art_hints[oldest] = nil
 		end
 	end
+end
+
+-- A search result as a playable track; artwork the catalog reported is
+-- remembered for the cover of that url.
+local function to_track(item: SearchItem): Track
+	if item.art ~= nil then
+		remember_art(item.url, item.art :: string)
+	end
+	return {
+		url = item.url,
+		video = item.video,
+		title = item.title,
+		artist = item.artist,
+		duration = item.duration,
+	}
 end
 
 local function normalized(text: string): string
@@ -685,7 +884,8 @@ end
 -- One search across both catalogs. The callback fires once per source that
 -- answers (YouTube Music is usually first), so the block shows its results
 -- while SoundCloud is still resolving; the merged list replaces it in place.
-function player.search(query: string, category: SearchCategory, done: (items: { SearchItem }, err: string?) -> ()): ()
+-- `pending` is true while the other source has not answered yet.
+function player.search(query: string, category: SearchCategory, done: (items: { SearchItem }, err: string?, pending: boolean?) -> ()): ()
 	if category ~= "tracks" then
 		catalog.search(query, category, done)
 		return
@@ -698,11 +898,14 @@ function player.search(query: string, category: SearchCategory, done: (items: { 
 	local others_done = false
 	local function deliver(): ()
 		local merged = merge_results(youtube, others)
-		if #merged == 0 and youtube_done and others_done then
-			done({}, if youtube_err ~= nil then youtube_err else others_err)
+		if #merged == 0 then
+			-- Nothing to show yet: wait for the other source before saying so.
+			if youtube_done and others_done then
+				done({}, if youtube_err ~= nil then youtube_err else others_err)
+			end
 			return
 		end
-		done(merged, nil)
+		done(merged, nil, not (youtube_done and others_done))
 	end
 	catalog.search(query, "tracks", function(items: { SearchItem }, err: string?)
 		youtube = items
@@ -965,29 +1168,52 @@ local recs_loading = false
 local recs_message = ""
 local recs_generation = 0
 -- The history_version the current recommendations were built for; -1 forces
--- the next poll to rebuild (the manual refresh button).
+-- the next poll to rebuild.
 local recs_built_for = -1
+local recs_built_at = -math.huge
 
-local function build_recommendations(): ()
+-- Fisher–Yates over a copy.
+local function shuffled<T>(items: { T }): { T }
+	local copy = table.clone(items)
+	for index = #copy, 2, -1 do
+		local other = math.random(index)
+		copy[index], copy[other] = copy[other], copy[index]
+	end
+	return copy
+end
+
+-- `vary` (the Refresh button) draws the seeds at random from a wider slice
+-- of the history and shuffles each pool, so a refresh shows new cards even
+-- though every related list comes from the cache.
+local function build_recommendations(vary: boolean): ()
 	if recs_loading then
 		return
 	end
 	load_preferences()
 	-- One seed per performer: several tracks of the same artist would only
 	-- re-derive one related bubble from different entry points.
-	local seeds: { Track } = {}
+	local candidates: { Track } = {}
 	local seed_artists: { [string]: boolean } = {}
+	local wanted = if vary then RECS_SEEDS * 2 else RECS_SEEDS
 	for _, entry in history do
-		if #seeds >= RECS_SEEDS then
+		if #candidates >= wanted then
 			break
 		end
 		local artist = normalize_artist(entry.artist)
 		if seed_artists[artist] ~= true then
 			seed_artists[artist] = true
-			table.insert(seeds, entry)
+			table.insert(candidates, entry)
 		end
 	end
+	local seeds: { Track } = candidates
+	if vary then
+		seeds = shuffled(candidates)
+	end
+	while #seeds > RECS_SEEDS do
+		table.remove(seeds)
+	end
 	recs_built_for = history_version
+	recs_built_at = tern.now()
 	if #seeds == 0 then
 		recs = {}
 		recs_message = ""
@@ -996,10 +1222,9 @@ local function build_recommendations(): ()
 		return
 	end
 	recs_loading = true
-	recs_message = "Picking recommendations…"
+	recs_message = ""
 	recs_generation += 1
 	local generation = recs_generation
-	local pools: { { Track } } = {}
 	local excluded: { [string]: boolean } = {}
 	for _, entry in history do
 		excluded[entry.url] = true
@@ -1007,27 +1232,41 @@ local function build_recommendations(): ()
 	for _, queued in queue do
 		excluded[queued.url] = true
 	end
-	local seed_index = 0
+	-- Every seed's lookups run at once (net caps how many are in flight);
+	-- each pool keeps its slot, so the feed order does not depend on which
+	-- answer arrives first.
+	local pools: { { Track } } = {}
+	local outstanding = 0
 	local failures = 0
-	local function finish(): ()
-		if generation ~= recs_generation then
+	local function settle(): ()
+		outstanding -= 1
+		if outstanding > 0 or generation ~= recs_generation then
 			return
 		end
 		recs_loading = false
-		recs = assemble_feed(pools, RECS_LIMIT, RECS_ARTIST_CAP, excluded)
-		recs_message = if #recs == 0 and failures > 0 then "No recommendations found" else ""
+		local ordered: { { Track } } = {}
+		for slot = 1, #seeds * 2 do
+			local pool = pools[slot]
+			if pool ~= nil and #pool > 0 then
+				local chosen: { Track } = pool
+				if vary then
+					chosen = shuffled(pool)
+				end
+				table.insert(ordered, chosen)
+			end
+		end
+		recs = assemble_feed(ordered, RECS_LIMIT, RECS_ARTIST_CAP, excluded)
+		recs_message = if #recs == 0 and failures > 0 then "Could not load recommendations" else ""
+		recs_version += 1
 		notify()
 	end
-	local function step(): ()
-		if generation ~= recs_generation then
-			return
+	for index in seeds do
+		outstanding += 1
+		if index <= RECS_PLAYLIST_PROBES then
+			outstanding += 1
 		end
-		seed_index += 1
-		local seed = seeds[seed_index]
-		if seed == nil then
-			finish()
-			return
-		end
+	end
+	for index, seed in seeds do
 		related_for_track(seed, function(tracks: { Track }, err: string?)
 			if generation ~= recs_generation then
 				return
@@ -1035,30 +1274,43 @@ local function build_recommendations(): ()
 			if err ~= nil then
 				failures += 1
 			end
-			table.insert(pools, tracks)
-			-- Radio-playlist probes for the first seeds only: each costs two
-			-- requests, a couple is enough for adjacent genres.
-			if seed_index <= RECS_PLAYLIST_PROBES then
-				radio_playlist_pool(seed, function(probe: { Track })
-					if generation ~= recs_generation then
-						return
-					end
-					table.insert(pools, probe)
-					step()
-				end)
-			else
-				step()
-			end
+			pools[index * 2 - 1] = tracks
+			settle()
 		end)
+		-- Radio-playlist probes for the first seeds only: each costs two
+		-- requests, a couple is enough for adjacent genres.
+		if index <= RECS_PLAYLIST_PROBES then
+			radio_playlist_pool(seed, function(probe: { Track })
+				if generation ~= recs_generation then
+					return
+				end
+				pools[index * 2] = probe
+				settle()
+			end)
+		end
 	end
 	notify()
-	step()
 end
 
 tick_recs = function(): ()
 	load_preferences()
-	if not recs_loading and recs_built_for ~= history_version then
-		build_recommendations()
+	if recs_loading then
+		-- A build whose answers never came back (a dropped callback) must
+		-- not block every later one.
+		if tern.now() - recs_built_at < 60 * 1000 then
+			return
+		end
+		recs_generation += 1
+		recs_loading = false
+	end
+	local age = tern.now() - recs_built_at
+	local moved = history_version ~= recs_built_for
+	local due = recs_built_for < 0
+		-- An empty row (offline, or nothing found) retries, but not every poll.
+		or (#recs == 0 and #history > 0 and age >= 60 * 1000)
+		or (moved and (history_version - recs_built_for >= RECS_HISTORY_DELTA or age >= RECS_MAX_AGE_MS))
+	if due then
+		build_recommendations(false)
 	end
 end
 
@@ -1076,15 +1328,18 @@ function player.recommendations_version(): number
 end
 
 function player.refresh_recommendations(): ()
-	-- Cancels any in-flight build; the poll below rebuilds right away.
+	-- Cancels any in-flight build and starts a varied one.
 	recs_generation += 1
 	recs_loading = false
-	recs_built_for = -1
-	build_recommendations()
+	build_recommendations(true)
 end
 
 tick_autoplay = function(): ()
 	load_preferences()
+	if autoplay_searching and tern.now() - autoplay_started > 60 * 1000 then
+		-- The lookup's answer never came back: let the next tick try again.
+		invalidate_autoplay()
+	end
 	local state = current
 	if not autoplay_enabled
 		or autoplay_searching
@@ -1108,6 +1363,7 @@ tick_autoplay = function(): ()
 
 	autoplay_seed = seed_key
 	autoplay_searching = true
+	autoplay_started = tern.now()
 	local generation = autoplay_generation
 	local seed_pid = state.pid
 	local seed_queue: { yt.Flat } = {}
@@ -1163,10 +1419,17 @@ tick_autoplay = function(): ()
 		end
 		autoplay_searching = false
 		local feed = assemble_feed(pools, AUTOPLAY_ADD_LIMIT, AUTOPLAY_ARTIST_CAP, excluded)
-		local added = 0
+		local added = #feed
+		if added > 0 then
+			if batch_capable() then
+				request("enqueuemany", false, table.unpack(track_args(feed, {})))
+			else
+				for _, track in feed do
+					request("enqueue", false, track.url, track.video, track.title, track.artist)
+				end
+			end
+		end
 		for _, track in feed do
-			request("enqueue", false, track.url, track.video, track.title, track.artist)
-			added += 1
 			remember_autoplay(track.url)
 		end
 		if added > 0 then
@@ -1377,30 +1640,43 @@ local function mime_of(bytes: string, header: string?): string
 	return "image/jpeg"
 end
 
+-- Records a fetch outcome for `url`: bytes, or "" for a failure that is
+-- retried after ART_RETRY_MS. Every entry counts against ART_MAX.
 local function store_cover(url: string, body: string, header: string?): ()
-	if body == "" then
-		art_cache[url] = { bytes = "", mime = "" }
-		return
+	if art_cache[url] == nil then
+		table.insert(art_order, url)
 	end
-	local mime = mime_of(body, header)
-	art_cache[url] = { bytes = body, mime = mime }
-	table.insert(art_order, url)
+	art_cache[url] = {
+		bytes = body,
+		mime = if body == "" then "" else mime_of(body, header),
+		at = tern.now(),
+	}
 	while #art_order > ART_MAX do
 		local evicted = table.remove(art_order, 1)
-		if evicted ~= nil then
+		-- The current hero art stays: evicting it would refetch it next poll.
+		if evicted ~= nil and evicted ~= art.key then
 			art_cache[evicted] = nil
+		elseif evicted ~= nil then
+			table.insert(art_order, evicted)
+			break
 		end
 	end
 end
 
+-- The cached entry for `url`, treating a failure past its retry time as absent.
+local function cached_cover(url: string): { bytes: string, mime: string, at: number }?
+	local cached = art_cache[url]
+	if cached ~= nil and cached.bytes == "" and tern.now() - cached.at >= ART_RETRY_MS then
+		return nil
+	end
+	return cached
+end
+
 local function fetch_cover(url: string, image: string, done: () -> ()): ()
-	tern.fetch(image, { timeout_ms = 15000 }, function(response: FetchResult, _cx)
-		if not cover_loading[url] then
-			return
-		end
+	net.fetch(image, { timeout_ms = COVER_TIMEOUT_MS, retries = 1 }, function(response: FetchResult)
 		cover_loading[url] = nil
-		if response.error ~= nil or response.status ~= 200 then
-			art_cache[url] = { bytes = "", mime = "" }
+		if response.error ~= nil or response.status ~= 200 or response.body == "" then
+			store_cover(url, "", nil)
 			return
 		end
 		store_cover(url, response.body, response.headers["content-type"])
@@ -1418,29 +1694,18 @@ end
 -- oEmbed endpoint for the artwork of the track URL — no client id, and it
 -- works after a plugin reload — unless search already reported the artwork.
 local function fetch_soundcloud_cover(url: string, done: () -> ()): ()
-	local hint = art_hints[url]
-	if hint ~= nil then
-		fetch_cover(url, hint, done)
-		return
-	end
 	local endpoint = "https://soundcloud.com/oembed?format=json&url=" .. urlencode(url)
-	tern.fetch(endpoint, { timeout_ms = 15000 }, function(response: FetchResult, _cx)
-		if not cover_loading[url] then
-			return
-		end
-		if response.error ~= nil or response.status ~= 200 or response.body == "" then
-			cover_loading[url] = nil
-			art_cache[url] = { bytes = "", mime = "" }
-			return
-		end
-		local ok, document = pcall(tern.json.decode, response.body)
+	net.fetch(endpoint, { timeout_ms = COVER_TIMEOUT_MS, retries = 1 }, function(response: FetchResult)
 		local thumbnail = ""
-		if ok and type(document) == "table" and type(document.thumbnail_url) == "string" then
-			thumbnail = document.thumbnail_url :: string
+		if response.error == nil and response.status == 200 and response.body ~= "" then
+			local ok, document = pcall(tern.json.decode, response.body)
+			if ok and type(document) == "table" and type(document.thumbnail_url) == "string" then
+				thumbnail = document.thumbnail_url :: string
+			end
 		end
 		if thumbnail == "" then
 			cover_loading[url] = nil
-			art_cache[url] = { bytes = "", mime = "" }
+			store_cover(url, "", nil)
 			return
 		end
 		remember_art(url, thumbnail)
@@ -1448,15 +1713,14 @@ local function fetch_soundcloud_cover(url: string, done: () -> ()): ()
 	end)
 end
 
--- Fetches the cover of `url` once into the cache (failed ones are remembered
--- as empty and never re-asked) and calls `done` when the bytes are there.
--- Fetches only; the current art is `load_cover`'s job, so several covers can
--- load side by side for the hero and the recommendation cards.
+-- Fetches the cover of `url` into the cache and calls `done` when the bytes
+-- are there. Fetches only; the current art is `load_cover`'s job, so several
+-- covers can load side by side for the hero and the recommendation cards.
 local function ensure_cover(url: string, done: () -> ()): ()
 	if url == "" then
 		return
 	end
-	local cached = art_cache[url]
+	local cached = cached_cover(url)
 	if cached ~= nil then
 		if cached.bytes ~= "" then
 			done()
@@ -1467,6 +1731,12 @@ local function ensure_cover(url: string, done: () -> ()): ()
 		return
 	end
 	cover_loading[url] = true
+	-- Artwork a catalog reported (square, unlike YouTube's 16:9 thumbnails).
+	local hint = art_hints[url]
+	if hint ~= nil then
+		fetch_cover(url, hint, done)
+		return
+	end
 	local source = yt.source_of(url)
 	if source == "soundcloud" then
 		fetch_soundcloud_cover(url, done)
@@ -1479,35 +1749,30 @@ local function ensure_cover(url: string, done: () -> ()): ()
 			return
 		end
 	end
-	-- A pasted link from a service without artwork here: fail once.
+	-- A pasted link from a service without artwork here.
 	cover_loading[url] = nil
-	art_cache[url] = { bytes = "", mime = "" }
+	store_cover(url, "", nil)
 end
 
--- Fetches the artwork of the track at `url` once and makes it the current
--- art, so the blocks re-send it as a blob; an empty cover shows the placeholder.
+-- Fetches the artwork of the track at `url` and makes it the current art,
+-- so the blocks re-send it as a blob; a missing cover shows the placeholder.
 function player.load_cover(url: string, arrived: () -> ()): ()
 	if url == "" then
 		return
 	end
-	local cached = art_cache[url]
+	local cached = cached_cover(url)
 	if cached ~= nil then
-		if cached.bytes == "" then
-			-- Artwork that failed before: do not ask for it every poll.
-			if art.key ~= url then
-				art = { key = url, bytes = nil, mime = nil }
-				arrived()
-			end
-			return
-		end
-		if art.key ~= url then
-			art = { key = url, bytes = cached.bytes, mime = cached.mime }
+		if art.key ~= url or (cached.bytes ~= "" and art.bytes == nil) then
+			art = if cached.bytes == ""
+				then { key = url, bytes = nil, mime = nil }
+				else { key = url, bytes = cached.bytes, mime = cached.mime }
 			arrived()
 		end
 		return
 	end
 	if art.key ~= url then
 		art = { key = url, bytes = nil, mime = nil }
+		arrived()
 	end
 	ensure_cover(url, function()
 		if art.key ~= url then

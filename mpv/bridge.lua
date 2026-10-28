@@ -12,7 +12,13 @@ local mp = require 'mp'
 local utils = require 'mp.utils'
 
 local TICK = 0.5      -- seconds between polls
-local CMD_STALE = 90  -- drop a half-written command file after this long
+-- The command protocol this bridge speaks, echoed as `proto=` in state.txt:
+-- 2 adds the batch commands (setqueue, enqueuemany, playnext) and the "."
+-- end marker on command files.
+local PROTO = 2
+-- A half-written command file blocks the ones after it (they run in order);
+-- a write takes milliseconds, so one this old was left by a crash: drop it.
+local CMD_STALE = 5
 
 -- Where the plugin keeps its files. The plugin passes it as TERN_YT_DATA, and
 -- on a host that applies the process working directory the two agree; the
@@ -42,6 +48,11 @@ local last_err = ''
 local last_state = nil
 local queue_dirty = true
 local first_tick = true
+-- queue.txt is rewritten only when its content changes; `qv` rises with each
+-- rewrite and is echoed in state.txt, so the plugin reads the queue file only
+-- when it changed and can tell a half-written one from the current one.
+local queue_version = 0
+local last_queue_text = nil
 
 -- Failed-entry hold: with `hold on` the bridge pauses after a load failure
 -- and reports the failed queue index, so the plugin can look up the same
@@ -130,8 +141,11 @@ local function snapshot()
 	local hint = hints[current] or {}
 	local metadata = mp.get_property_native('metadata') or {}
 	local title = mp.get_property('media-title') or ''
-	if title == '' then
-		title = hint.title or ''
+	-- Until the stream resolves, media-title is the tail of the URL
+	-- ("watch?v=…"); the title the plugin queued reads better.
+	local placeholder = title == '' or (#title <= #current and current:sub(-#title) == title)
+	if placeholder and (hint.title or '') ~= '' then
+		title = hint.title
 	end
 	local artist = metadata_value(metadata, { 'artist', 'ARTIST', 'uploader', 'channel', 'creator' }) or hint.artist or ''
 	local duration = mp.get_property_number('duration')
@@ -157,6 +171,8 @@ local function snapshot()
 		'index=' .. tostring(mp.get_property_number('playlist-pos') or -1),
 		'count=' .. tostring(mp.get_property_number('playlist-count') or 0),
 		'seq=' .. tostring(end_seq),
+		'qv=' .. tostring(queue_version),
+		'proto=' .. tostring(PROTO),
 		'end=' .. clean(end_reason),
 		'title=' .. clean(title),
 		'artist=' .. clean(artist),
@@ -165,11 +181,15 @@ local function snapshot()
 		'failed=' .. tostring(failed_index),
 		'fail_seq=' .. tostring(fail_seq),
 		'err=' .. clean(last_err),
+		-- Written last: a reader that sees no `ok=1` caught the file mid-write.
+		'ok=1',
 	}
 	return table.concat(lines, '\n') .. '\n'
 end
 
-local function write_queue()
+-- Rewrites queue.txt when the playlist (or a hint shown in it) changed. The
+-- last line carries the version, so a reader can match it against `qv=`.
+local function write_queue(force)
 	local entries = mp.get_property_native('playlist') or {}
 	local lines = {}
 	for index, entry in ipairs(entries) do
@@ -184,10 +204,15 @@ local function write_queue()
 		}, '\t')
 	end
 	local text = table.concat(lines, '\n')
+	if text == last_queue_text and not force then
+		return
+	end
+	last_queue_text = text
+	queue_version = queue_version + 1
 	if text ~= '' then
 		text = text .. '\n'
 	end
-	write_file(QUEUE, text)
+	write_file(QUEUE, text .. '#qv\t' .. tostring(queue_version) .. '\n')
 end
 
 local commands = {}
@@ -295,6 +320,31 @@ commands['enqueue'] = function(args)
 	queue_dirty = true
 end
 
+-- Appends tracks given as groups of four lines (url, video id, title, artist),
+-- so a whole playlist is one command file instead of one per track.
+local function append_tracks(args, first)
+	for index = first, #args, 4 do
+		local url = args[index] or ''
+		if url ~= '' then
+			hints[url] = { id = args[index + 1] or '', title = args[index + 2] or '', artist = args[index + 3] or '' }
+			mp.commandv('loadfile', url, 'append')
+		end
+	end
+	queue_dirty = true
+end
+
+commands['enqueuemany'] = function(args)
+	append_tracks(args, 1)
+end
+
+-- Replaces the queue with the tracks that follow and plays entry `args[1]`.
+commands['setqueue'] = function(args)
+	local start = math.max(0, math.floor(tonumber(args[1]) or 0))
+	commands['clear']()
+	append_tracks(args, 2)
+	play_index(start)
+end
+
 commands['jump'] = function(args)
 	local index = tonumber(args[1])
 	if index == nil or index < 0 then
@@ -327,6 +377,22 @@ end
 
 commands['quit'] = function()
 	mp.commandv('quit')
+end
+
+-- Adds a track right after the current one, so it plays next.
+commands['playnext'] = function(args)
+	local url = args[1] or ''
+	if url == '' then
+		return
+	end
+	hints[url] = { id = args[2] or '', title = args[3] or '', artist = args[4] or '' }
+	local count = mp.get_property_number('playlist-count') or 0
+	local pos = mp.get_property_number('playlist-pos') or -1
+	mp.commandv('loadfile', url, count == 0 and 'append-play' or 'append')
+	if pos >= 0 and pos + 1 < count then
+		mp.commandv('playlist-move', tostring(count), tostring(pos + 1))
+	end
+	queue_dirty = true
 end
 
 commands['hold'] = function(args)
@@ -388,9 +454,11 @@ commands['dump'] = function()
 end
 
 local function run_command(text)
+	-- One argument per line, empty ones included: a SoundCloud track has no
+	-- video id, and dropping that blank line would shift title into its place.
 	local lines = {}
-	for line in text:gmatch('[^\n]+') do
-		lines[#lines + 1] = line
+	for line in text:gmatch('([^\n]*)\n') do
+		lines[#lines + 1] = (line:gsub('\r$', ''))
 	end
 	local name = table.remove(lines, 1)
 	if name == nil or name == '' or name == 'done' then
@@ -408,6 +476,13 @@ local function run_command(text)
 	end
 end
 
+-- A command file is complete when its last line is the "." end marker the
+-- plugin writes after the arguments: a batch of hundreds of lines can be
+-- caught mid-write at a line break, and must not run cut short.
+local function complete_body(text)
+	return text:match('^(.*\n)%.\r?\n$')
+end
+
 local function process_commands()
 	local files = utils.readdir(CMDS, 'files')
 	if files == nil then
@@ -418,10 +493,11 @@ local function process_commands()
 	for _, name in ipairs(files) do
 		local full = utils.join_path(CMDS, name)
 		local text = read_file(full)
-		if text == nil then
+		local body = text and complete_body(text)
+		if text == nil or text == 'done\n' then
 			os.remove(full)
-		elseif text:sub(-1) == '\n' then
-			run_command(text)
+		elseif body ~= nil then
+			run_command(body)
 			if not os.remove(full) then
 				write_file(full, 'done\n')
 			end
@@ -430,31 +506,35 @@ local function process_commands()
 			local info = utils.file_info(full)
 			if info ~= nil and now - (info.mtime or now) > CMD_STALE then
 				os.remove(full)
+			else
+				-- Later commands wait for this one, so they run in order.
+				break
 			end
 		end
 	end
 end
 
--- True when a newer bridge owns the fresh state file. A replacement records
--- the PID it found at startup so it can reclaim that owner's last write.
-local function taken_over()
-	local text = read_file(STATE)
+-- Who owns the state file now: a newer bridge that took over (its pid is
+-- neither ours nor the one we replaced, and its beat is fresh), or the
+-- player this bridge replaced, whose last write is ours to reclaim.
+local function owner_of(text)
 	if text == nil then
-		return false
+		return false, false
 	end
 	local beat = tonumber(string.match(text, 'beat=(%d+)') or '')
 	local pid = tonumber(string.match(text, 'pid=(%d+)') or '')
 	if beat == nil or pid == nil then
-		return false
+		return false, false
 	end
-	if os.time() - beat > 3 then
-		return false
-	end
-	return pid ~= utils.getpid() and pid ~= previous_pid
+	local mine = utils.getpid()
+	local reclaim = pid == previous_pid and pid ~= mine
+	local taken = os.time() - beat <= 3 and pid ~= mine and pid ~= previous_pid
+	return taken, reclaim
 end
 
 local function tick()
-	if not first_tick and taken_over() then
+	local taken, reclaim_previous = owner_of(read_file(STATE))
+	if not first_tick and taken then
 		mp.msg.info('tern bridge: another player owns the state file; stopping')
 		mp.commandv('quit')
 		return
@@ -464,31 +544,18 @@ local function tick()
 		mp.msg.info('tern bridge: hold timed out; releasing the queue')
 		clear_hold(true)
 	end
+	-- The queue goes first: a reader that sees the new `qv` in state.txt
+	-- finds the matching queue.txt already in place.
+	write_queue(queue_dirty)
+	queue_dirty = false
 	local state = snapshot()
-	local owner_text = read_file(STATE) or ''
-	local owner_pid = tonumber(string.match(owner_text, 'pid=(%d+)') or '')
-	local reclaim_previous = owner_pid ~= nil
-		and owner_pid == previous_pid
-		and owner_pid ~= utils.getpid()
 	if state ~= last_state or reclaim_previous then
 		last_state = state
 		write_file(STATE, state)
-		queue_dirty = true
-	end
-	if queue_dirty then
-		queue_dirty = false
-		write_queue()
 	end
 	first_tick = false
 	mp.add_timeout(TICK, tick)
 end
-
-mp.observe_property('playlist-pos', nil, function()
-	queue_dirty = true
-end)
-mp.observe_property('playlist-count', nil, function()
-	queue_dirty = true
-end)
 
 -- The failed queue index of an `end-file` error: the event carries the
 -- entry's id, which is also in the playlist; the positions remain as
@@ -518,7 +585,12 @@ mp.register_event('end-file', function(event)
 	end_seq = end_seq + 1
 	end_reason = event.reason or 'unknown'
 	if end_reason == 'error' then
-		last_err = 'playback failed; see mpv.log'
+		local detail = event.file_error
+		if type(detail) == 'string' and detail ~= '' then
+			last_err = 'playback failed (' .. detail .. '); see mpv.log'
+		else
+			last_err = 'playback failed; see mpv.log'
+		end
 		local position = failed_position(event)
 		if hold_enabled and not paused_by_hold and position >= 0 then
 			failed_index = position

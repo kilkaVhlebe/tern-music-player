@@ -1,8 +1,9 @@
 --!strict
 -- Public YouTube Music search and related-track endpoints.
 -- The API is undocumented; category filtering keeps results inside the music catalog.
-local catalog = {}
+local net = require("./net")
 
+local catalog = {}
 export type Category = "tracks" | "artists" | "playlists" | "podcasts"
 export type Kind = "track" | "artist" | "playlist" | "podcast"
 export type Item = {
@@ -74,20 +75,46 @@ local function column(row: any, index: number): string
 	return text(path(row, { "flexColumns", index, "musicResponsiveListItemFlexColumnRenderer", "text" }))
 end
 
-local function duration_seconds(row: any): number?
-	local columns = field(row, "flexColumns")
-	if type(columns) ~= "table" then
-		return nil
+local function clock_seconds(value: string): number?
+	local hours, minutes, seconds = string.match(value, "^(%d+):(%d%d):(%d%d)$")
+	if hours ~= nil and minutes ~= nil and seconds ~= nil then
+		return (tonumber(hours) or 0) * 3600 + (tonumber(minutes) or 0) * 60 + (tonumber(seconds) or 0)
 	end
-	for _, flex in columns do
-		local value = text(path(flex, { "musicResponsiveListItemFlexColumnRenderer", "text" }))
-		local hours, minutes, seconds = string.match(value, "^(%d+):(%d%d):(%d%d)$")
-		if hours ~= nil and minutes ~= nil and seconds ~= nil then
-			return (tonumber(hours) or 0) * 3600 + (tonumber(minutes) or 0) * 60 + (tonumber(seconds) or 0)
+	minutes, seconds = string.match(value, "^(%d+):(%d%d)$")
+	if minutes ~= nil and seconds ~= nil then
+		return (tonumber(minutes) or 0) * 60 + (tonumber(seconds) or 0)
+	end
+	return nil
+end
+
+-- A column's text split on the " • " separators YouTube Music puts between
+-- artist, album, view count and duration.
+local function segments(value: string): { string }
+	local parts: { string } = {}
+	for part in string.gmatch(value .. " • ", "(.-) • ") do
+		local trimmed = string.match(part, "^%s*(.-)%s*$") or ""
+		if trimmed ~= "" then
+			table.insert(parts, trimmed)
 		end
-		minutes, seconds = string.match(value, "^(%d+):(%d%d)$")
-		if minutes ~= nil and seconds ~= nil then
-			return (tonumber(minutes) or 0) * 60 + (tonumber(seconds) or 0)
+	end
+	return parts
+end
+
+-- The duration from a flex column segment or a fixed column (playlist rows).
+local function duration_seconds(row: any): number?
+	for _, group in { "flexColumns", "fixedColumns" } do
+		local columns = field(row, group)
+		if type(columns) == "table" then
+			for _, column_value in columns do
+				local renderer = field(column_value, "musicResponsiveListItemFlexColumnRenderer")
+					or field(column_value, "musicResponsiveListItemFixedColumnRenderer")
+				for _, part in segments(text(field(renderer, "text"))) do
+					local seconds = clock_seconds(part)
+					if seconds ~= nil then
+						return seconds
+					end
+				end
+			end
 		end
 	end
 	return nil
@@ -128,7 +155,41 @@ local function accepted_type(video_type: string): boolean
 		or video_type == "MUSIC_VIDEO_TYPE_PODCAST_EPISODE"
 end
 
-local function new_item(kind: Kind, title: string, artist: string, detail: string, video: string, duration: number?, browse_id: string): Item
+local function artwork_of(row: any): string?
+	local thumbs = path(row, { "thumbnail", "musicThumbnailRenderer", "thumbnail", "thumbnails" })
+	if type(thumbs) ~= "table" then
+		return nil
+	end
+	local best_url = ""
+	local best_size = -1
+	for _, thumb in thumbs do
+		if type(thumb) == "table" and type(thumb.url) == "string" and thumb.url ~= "" then
+			local w = if type(thumb.width) == "number" then thumb.width else 0
+			if w >= best_size then
+				best_size = w
+				best_url = thumb.url
+			end
+		end
+	end
+	if best_url == "" then
+		return nil
+	end
+	if string.find(best_url, "googleusercontent.com", 1, true) ~= nil then
+		return string.gsub(best_url, "=w%d+%-h%d+.*$", "=w300-h300-l90-rj")
+	end
+	return best_url
+end
+
+local function new_item(
+	kind: Kind,
+	title: string,
+	artist: string,
+	detail: string,
+	video: string,
+	duration: number?,
+	browse_id: string,
+	art: string?
+): Item
 	return {
 		kind = kind,
 		title = title,
@@ -138,24 +199,39 @@ local function new_item(kind: Kind, title: string, artist: string, detail: strin
 		video = video,
 		duration = duration,
 		browse_id = browse_id,
+		art = art,
 	}
 end
 
 local function track_from_row(row: any, require_recommendation_type: boolean): Item?
 	local video = video_id(row)
 	local title = column(row, 1)
-	local artist = column(row, 2)
 	local kind = music_video_type(row)
 	if video == "" or title == "" then
 		return nil
 	end
-	if require_recommendation_type and (kind ~= "MUSIC_VIDEO_TYPE_ATV" and kind ~= "MUSIC_VIDEO_TYPE_OMV") then
+	if require_recommendation_type then
+		if kind ~= "MUSIC_VIDEO_TYPE_ATV" and kind ~= "MUSIC_VIDEO_TYPE_OMV" then
+			return nil
+		end
+	elseif kind ~= "" and not accepted_type(kind) then
 		return nil
 	end
-	if kind ~= "" and not accepted_type(kind) then
-		return nil
+	-- Column 2 reads "Artist • Album • 3:45" (search) or just "Artist"
+	-- (related, playlists): the artist is the first segment, the album the
+	-- next one that is not a duration or a play count.
+	local parts = segments(column(row, 2))
+	local artist = parts[1] or ""
+	local album = ""
+	for index = 2, #parts do
+		local part = parts[index]
+		if clock_seconds(part) == nil and not string.find(part, "%d[%d%.,]*[KMB]? plays$") and not string.find(part, "views$") then
+			album = part
+			break
+		end
 	end
-	return new_item("track", title, artist, artist, video, duration_seconds(row), "")
+	local detail = if album ~= "" then artist .. " · " .. album else artist
+	return new_item("track", title, artist, detail, video, duration_seconds(row), "", artwork_of(row))
 end
 
 local function podcast_episode(row: any): Item?
@@ -169,7 +245,7 @@ local function podcast_episode(row: any): Item?
 		return nil
 	end
 	local detail = column(row, 2)
-	return new_item("track", title, detail, detail, video, nil, "")
+	return new_item("track", title, detail, detail, video, nil, "", artwork_of(row))
 end
 
 local function collect(value: any, key_name: string, output: { any }, depth: number): ()
@@ -202,6 +278,10 @@ local function decode_response(response: any, done: (document: any?, err: string
 	done(document, nil)
 end
 
+local cached_api_key: string? = nil
+local last_key_attempt = 0
+local KEY_RETRY_COOLDOWN_MS = 30000
+
 local function read_api_key(): (string?, string?)
 	local ok, content = pcall(tern.fs.read, SECRETS_FILE, 4096)
 	if not ok or type(content) ~= "string" then
@@ -218,8 +298,25 @@ local function read_api_key(): (string?, string?)
 	return key, nil
 end
 
+local function get_api_key(): (string?, string?)
+	if cached_api_key ~= nil then
+		return cached_api_key, nil
+	end
+	local now = tern.now()
+	if last_key_attempt > 0 and (now - last_key_attempt) < KEY_RETRY_COOLDOWN_MS then
+		return nil, "Missing or invalid .secrets.json (retrying in " .. tostring(math.ceil((KEY_RETRY_COOLDOWN_MS - (now - last_key_attempt)) / 1000)) .. "s)"
+	end
+	last_key_attempt = now
+	local key, key_error = read_api_key()
+	if key ~= nil then
+		cached_api_key = key
+		return key, nil
+	end
+	return nil, key_error
+end
+
 local function post(endpoint: string, body: { [string]: any }, done: (document: any?, err: string?) -> ()): ()
-	local api_key, key_error = read_api_key()
+	local api_key, key_error = get_api_key()
 	if api_key == nil then
 		done(nil, key_error)
 		return
@@ -239,89 +336,93 @@ local function post(endpoint: string, body: { [string]: any }, done: (document: 
 		return
 	end
 	local url = API .. endpoint .. "?alt=json&key=" .. api_key
-	local started = pcall(function()
-		tern.fetch(url, {
-			method = "POST",
-			headers = {
-				["Content-Type"] = "application/json",
-				Origin = "https://music.youtube.com",
-				["User-Agent"] = USER_AGENT,
-			},
-			body = encoded,
-			timeout_ms = 15000,
-		}, function(response: FetchResult, _cx)
-			decode_response(response, done)
-		end)
+	net.fetch(url, {
+		method = "POST",
+		headers = {
+			["Content-Type"] = "application/json",
+			Origin = "https://music.youtube.com",
+			["User-Agent"] = USER_AGENT,
+		},
+		body = encoded,
+		timeout_ms = 15000,
+		retries = 1,
+	}, function(response: FetchResult)
+		decode_response(response, done)
 	end)
-	if not started then
-		done(nil, "Could not start YouTube Music request")
-	end
 end
+
+local SEARCH_MEMO_TTL_MS = 10 * 60 * 1000
+local BROWSE_MEMO_TTL_MS = 30 * 60 * 1000
+local RELATED_MEMO_TTL_MS = 30 * 60 * 1000
 
 function catalog.search(query: string, category: Category, done: (items: { Item }, err: string?) -> ()): ()
 	if query == "" then
 		done({}, nil)
 		return
 	end
-	post("search", { query = query, params = SEARCH_PARAMS[category] }, function(document: any?, err: string?)
-		if err ~= nil or document == nil then
+	local memo_key = "yt:search:" .. category .. ":" .. query
+	net.memo(memo_key, SEARCH_MEMO_TTL_MS, function(finish)
+		post("search", { query = query, params = SEARCH_PARAMS[category] }, function(document: any?, err: string?)
+			if err ~= nil or document == nil then
+				finish(nil, err)
+				return
+			end
+			local rows: { any } = {}
+			collect(document, "musicResponsiveListItemRenderer", rows, 0)
+			local items: { Item } = {}
+			local seen: { [string]: boolean } = {}
+			for _, row in rows do
+				if category == "tracks" then
+					local item = track_from_row(row, false)
+					if item ~= nil and seen[item.video] ~= true then
+						table.insert(items, item)
+						seen[item.video] = true
+					end
+				else
+					local browse_id = path(row, { "navigationEndpoint", "browseEndpoint", "browseId" })
+					local title = column(row, 1)
+					if type(browse_id) == "string" and browse_id ~= "" and title ~= "" and seen[browse_id] ~= true then
+						local kind: Kind = if category == "artists"
+							then "artist"
+							elseif category == "playlists" then "playlist"
+							else "podcast"
+						local detail = column(row, 2)
+						table.insert(
+							items,
+							new_item(kind, title, if kind == "artist" then title else detail, detail, "", nil, browse_id, artwork_of(row))
+						)
+						seen[browse_id] = true
+					end
+				end
+				if #items >= LIMIT then
+					break
+				end
+			end
+			finish(items, nil)
+		end)
+	end, function(value: any, err: string?)
+		if err ~= nil or value == nil then
 			done({}, err)
-			return
+		else
+			done(value :: { Item }, nil)
 		end
-		local rows: { any } = {}
-		collect(document, "musicResponsiveListItemRenderer", rows, 0)
-		local items: { Item } = {}
-		local seen: { [string]: boolean } = {}
-		for _, row in rows do
-			if category == "tracks" then
-				local item = track_from_row(row, false)
-				if item ~= nil and seen[item.video] ~= true then
-					table.insert(items, item)
-					seen[item.video] = true
-				end
-			else
-				local browse_id = path(row, { "navigationEndpoint", "browseEndpoint", "browseId" })
-				local title = column(row, 1)
-				if type(browse_id) == "string" and browse_id ~= "" and title ~= "" and seen[browse_id] ~= true then
-					local kind: Kind = if category == "artists" then "artist" elseif category == "playlists" then "playlist" else "podcast"
-					local detail = column(row, 2)
-					table.insert(items, new_item(kind, title, if kind == "artist" then title else detail, detail, "", nil, browse_id))
-					seen[browse_id] = true
-				end
-			end
-			if #items >= LIMIT then
-				break
-			end
-		end
-		done(items, nil)
 	end)
 end
 
 function catalog.browse(browse_id: string, kind: Kind, done: (items: { Item }, err: string?) -> ()): ()
-	post("browse", { browseId = browse_id }, function(document: any?, err: string?)
-		if err ~= nil or document == nil then
-			done({}, err)
-			return
-		end
-		local rows: { any } = {}
-		collect(document, "musicResponsiveListItemRenderer", rows, 0)
-		local items: { Item } = {}
-		local seen: { [string]: boolean } = {}
-		for _, row in rows do
-			local item = track_from_row(row, false)
-			if item ~= nil and seen[item.video] ~= true then
-				table.insert(items, item)
-				seen[item.video] = true
+	local memo_key = "yt:browse:" .. kind .. ":" .. browse_id
+	net.memo(memo_key, BROWSE_MEMO_TTL_MS, function(finish)
+		post("browse", { browseId = browse_id }, function(document: any?, err: string?)
+			if err ~= nil or document == nil then
+				finish(nil, err)
+				return
 			end
-			if #items >= LIMIT then
-				break
-			end
-		end
-		if kind == "podcast" and #items < LIMIT then
-			local episodes: { any } = {}
-			collect(document, "musicMultiRowListItemRenderer", episodes, 0)
-			for _, row in episodes do
-				local item = podcast_episode(row)
+			local rows: { any } = {}
+			collect(document, "musicResponsiveListItemRenderer", rows, 0)
+			local items: { Item } = {}
+			local seen: { [string]: boolean } = {}
+			for _, row in rows do
+				local item = track_from_row(row, false)
 				if item ~= nil and seen[item.video] ~= true then
 					table.insert(items, item)
 					seen[item.video] = true
@@ -330,8 +431,28 @@ function catalog.browse(browse_id: string, kind: Kind, done: (items: { Item }, e
 					break
 				end
 			end
+			if kind == "podcast" and #items < LIMIT then
+				local episodes: { any } = {}
+				collect(document, "musicMultiRowListItemRenderer", episodes, 0)
+				for _, row in episodes do
+					local item = podcast_episode(row)
+					if item ~= nil and seen[item.video] ~= true then
+						table.insert(items, item)
+						seen[item.video] = true
+					end
+					if #items >= LIMIT then
+						break
+					end
+				end
+			end
+			finish(items, nil)
+		end)
+	end, function(value: any, err: string?)
+		if err ~= nil or value == nil then
+			done({}, err)
+		else
+			done(value :: { Item }, nil)
 		end
-		done(items, nil)
 	end)
 end
 
@@ -340,56 +461,67 @@ function catalog.related(video: string, done: (items: { Item }, err: string?) ->
 		done({}, nil)
 		return
 	end
-	post("next", {
-		videoId = video,
-		playlistId = "RDAMVM" .. video,
-		enablePersistentPlaylistPanel = true,
-		isAudioOnly = true,
-		tunerSettingValue = "AUTOMIX_SETTING_NORMAL",
-	}, function(document: any?, err: string?)
-		if err ~= nil or document == nil then
-			done({}, err)
-			return
-		end
-		local tabs = path(document, { "contents", "singleColumnMusicWatchNextResultsRenderer", "tabbedRenderer", "watchNextTabbedResultsRenderer", "tabs" })
-		local related_id = ""
-		if type(tabs) == "table" then
-			for _, tab in tabs do
-				if path(tab, { "tabRenderer", "title" }) == "Related" then
-					local id = path(tab, { "tabRenderer", "endpoint", "browseEndpoint", "browseId" })
-					if type(id) == "string" then
-						related_id = id
-					end
-					break
-				end
-			end
-		end
-		if related_id == "" then
-			done({}, nil)
-			return
-		end
-		post("browse", { browseId = related_id }, function(related: any?, related_error: string?)
-			if related_error ~= nil or related == nil then
-				done({}, related_error)
+	local memo_key = "yt:related:" .. video
+	net.memo(memo_key, RELATED_MEMO_TTL_MS, function(finish)
+		post("next", {
+			videoId = video,
+			playlistId = "RDAMVM" .. video,
+			enablePersistentPlaylistPanel = true,
+			isAudioOnly = true,
+			tunerSettingValue = "AUTOMIX_SETTING_NORMAL",
+		}, function(document: any?, err: string?)
+			if err ~= nil or document == nil then
+				finish(nil, err)
 				return
 			end
-			local rows: { any } = {}
-			collect(related, "musicResponsiveListItemRenderer", rows, 0)
-			local items: { Item } = {}
-			local seen: { [string]: boolean } = {}
-			for _, row in rows do
-				local item = track_from_row(row, true)
-				if item ~= nil and item.video ~= video and seen[item.video] ~= true then
-					table.insert(items, item)
-					seen[item.video] = true
-				end
-				if #items >= LIMIT then
-					break
+			local tabs = path(
+				document,
+				{ "contents", "singleColumnMusicWatchNextResultsRenderer", "tabbedRenderer", "watchNextTabbedResultsRenderer", "tabs" }
+			)
+			local related_id = ""
+			if type(tabs) == "table" then
+				for _, tab in tabs do
+					if path(tab, { "tabRenderer", "title" }) == "Related" then
+						local id = path(tab, { "tabRenderer", "endpoint", "browseEndpoint", "browseId" })
+						if type(id) == "string" then
+							related_id = id
+						end
+						break
+					end
 				end
 			end
-			done(items, nil)
+			if related_id == "" then
+				finish({}, nil)
+				return
+			end
+			post("browse", { browseId = related_id }, function(related: any?, related_error: string?)
+				if related_error ~= nil or related == nil then
+					finish(nil, related_error)
+					return
+				end
+				local rows: { any } = {}
+				collect(related, "musicResponsiveListItemRenderer", rows, 0)
+				local items: { Item } = {}
+				local seen: { [string]: boolean } = {}
+				for _, row in rows do
+					local item = track_from_row(row, true)
+					if item ~= nil and item.video ~= video and seen[item.video] ~= true then
+						table.insert(items, item)
+						seen[item.video] = true
+					end
+					if #items >= LIMIT then
+						break
+					end
+				end
+				finish(items, nil)
+			end)
 		end)
+	end, function(value: any, err: string?)
+		if err ~= nil or value == nil then
+			done({}, err)
+		else
+			done(value :: { Item }, nil)
+		end
 	end)
 end
-
 return catalog
